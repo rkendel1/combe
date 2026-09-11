@@ -6,7 +6,9 @@ Before changing GUI code, update the affected prototype tokens, components, and 
 
 ## Scope
 
-A curated worktree list plus real Ghostty terminals. Do not add agents, an editor, a browser, SSH, a settings GUI, a theme system, a command palette, or cloud sync.
+Combe is a worktree-aware terminal and human/agent coordination application. Provider profiles, explicit recipients, provider/model selection, capability-aware routing, local and network transports, external conversation references, and Keychain-backed credentials are first-class capabilities. Durable Work and provider configuration live in FeltDB; credential contents live only in macOS Keychain.
+
+Do not leak provider-specific concepts into core Work models, persist or log secrets, mirror provider transcripts, choose fallback recipients or models, build autonomous agent loops, add arbitrary background execution, create duplicate/provider-specific persistence stores, or present manual ChatGPT transfer as an API connection. An editor, browser, SSH, theme system, command palette, cloud sync, autonomous orchestration, and arbitrary plugin or remote-shell execution remain out of scope.
 
 ## Interaction reference
 
@@ -23,7 +25,7 @@ A curated worktree list plus real Ghostty terminals. Do not add agents, an edito
 - Terminal: every leaf is a complete `libghostty` surface. Never write a VT parser, glyph atlas, or renderer.
 - API surface: whatever `vendor/ghostty/include/ghostty.h` declares. Do not invent bindings.
 - Catalog: user's `git` binary, `worktree list --porcelain`, Git 2.25 floor.
-- Persist only repo paths. Every other preference is a constant in `crates/combe/src/habits.rs`.
+- Persist repo paths, provider profiles, recipients, and provider-neutral Work state through the existing stores. Every other preference is a constant in `crates/combe/src/habits.rs`. Credential references may persist; credential contents may not.
 
 ## Standard shortcuts
 

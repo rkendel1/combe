@@ -238,6 +238,10 @@
     .work-overview ul { margin: 0; padding-left: 18px; color: var(--text-soft); line-height: 1.55; }
     .work-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
     .work-action { border: 0; border-radius: 8px; padding: 7px 14px; background: var(--selection); color: var(--text-strong); }
+    .route-composer { display: grid; gap: 8px; margin-top: 18px; padding: 14px; border: .5px solid var(--line); border-radius: 10px; background: var(--card); }
+    .route-composer label { color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; }
+    .route-composer select, .route-composer textarea { width: 100%; box-sizing: border-box; border: .5px solid var(--line); border-radius: 7px; padding: 8px; background: var(--terminal); color: var(--text); font: inherit; }
+    .route-detail { color: var(--text-soft); font-size: 12px; }
     .proposal-card { margin: 8px 0; padding: 12px; border: .5px solid var(--line); border-radius: 10px; color: var(--text-soft); line-height: 1.45; }
     .proposal-card strong { display: block; color: var(--text-strong); font-weight: 600; }
     .proposal-card small { display: block; margin-top: 3px; color: var(--muted); }
@@ -248,6 +252,9 @@
     .work-group { margin-top: 16px; padding-top: 8px; border-top: .5px solid var(--line); }
     .work-row { padding-left: 32px; }
     .work-row .work-state { margin-left: auto; color: var(--green); font-size: 11px; }
+    .work-row[data-status="paused"] .work-state { color: var(--soft); }
+    .work-row[data-status="completed"] .work-state { color: var(--text); }
+    .work-row[data-status="archived"] .work-state { color: var(--muted); }
     .pane { position: relative; }
     .find-bar { position: absolute; right: 12px; top: 8px; z-index: 2; display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: var(--glass-panel); box-shadow: var(--glass-edge), 0 6px 20px #0002; border-radius: 12px; font: var(--font); }
     .find-bar input { width: 120px; }
@@ -259,6 +266,9 @@
     dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
     dialog button { border: 0; border-radius: 7px; padding: 6px 14px; background: var(--hover); }
     dialog button[value="close"] { color: white; background: var(--blue); }
+    .provider-form { display: grid; gap: 8px; }
+    .provider-form label { color: var(--muted); font-size: 11px; font-weight: 600; text-transform: uppercase; }
+    .provider-form input, .provider-form select { width: 100%; box-sizing: border-box; }
     .components { color: var(--muted); margin: 24px 2px 0; font-size: 12px; }
     .components p { max-width: 760px; line-height: 1.6; }
     .components a { color: var(--text-strong); }
@@ -325,9 +335,10 @@
           </div>
           <div class="sidebar-resize" role="separator" aria-label="Sidebar width" aria-orientation="vertical" aria-valuemin="160" aria-valuemax="420" aria-valuenow="300" tabindex="0"></div>
         </aside>
+        <template id="chatgpt-participant"><h2>ChatGPT</h2><div class="proposal-card"><strong>Conversation</strong>Architecture discussion<small>Manual transfer · no direct transport</small><div class="work-actions"><button class="work-action" id="chatgpt-prepare" type="button">Prepare Context</button><button class="work-action" id="chatgpt-propose" type="button">Propose</button><button class="work-action" id="chatgpt-review" type="button">Review Completed Work…</button><button class="work-action" id="chatgpt-import" type="button">Import Response</button></div></div></template>
         <section class="right" aria-label="Terminal preview">
           <div class="tabs" id="tabs"></div>
-          <div class="term"><div class="pane" id="left"></div><div class="pane" id="right"></div><article class="work-overview" id="work-overview" aria-label="Work overview" hidden><h1>AuthPort integration</h1><span class="work-status">● Active</span><p class="work-objective">Move authorization behind a stable port while preserving the provider-neutral Work boundary.</p><div class="work-actions"><button class="work-action" id="work-new-proposal" type="button">New Proposal</button><button class="work-action" id="work-review" type="button">Review</button><button class="work-action" id="work-approve" type="button">Approve</button><button class="work-action" id="work-reject" type="button">Reject</button><button class="work-action" id="work-assign" type="button">Assign</button><button class="work-action" id="work-export" type="button">Export Context</button><button class="work-action" id="work-import" type="button">Import Contribution</button><button class="work-action" id="work-handoff" type="button">Handoff…</button></div><h2>Coordination</h2><div class="proposal-card"><strong>Proposal · Move authorization into AuthPort</strong>✓ Approved by Randy<small>Execution · Codex · Completed</small><small>Review · Awaiting review</small><small>Next · Review execution</small></div><h2>Proposals</h2><div class="proposal-card"><strong>Move authorization into AuthPort</strong>Proposed · ChatGPT<small>Awaiting review</small></div><h2>Approved</h2><div class="proposal-card"><strong>Keep provider adapters outside Work</strong>Approved · Randy<small>Decision recorded</small></div><h2>Assigned</h2><ul><li>Codex · Add authorization contract tests</li></ul><h2>Active executions</h2><div class="proposal-card"><strong>Implement the approved AuthPort approach</strong>Started · Codex<small>Provider: codex · heartbeat current</small></div><h2>Stale executions</h2><ul><li>None</li></ul><h2>Completed work</h2><ul><li>Codex · Added provider-neutral authorization boundary</li></ul><h2>Failed work</h2><ul><li>None</li></ul><h2>Cancelled work</h2><ul><li>None</li></ul><h2>Conversations</h2><ul class="conversation-list"><li><span>ChatGPT</span><small>Architecture discussion</small><span class="turn-count">2 turns</span></li><li><span>Codex</span><small>Implementation handoff</small><span class="turn-count">3 turns</span></li></ul><h2>Participants</h2><ul><li>Randy · Human</li><li>ChatGPT · Agent</li><li>Codex · Agent</li></ul><h2>Decisions</h2><ul><li>Keep provider adapters outside Work</li></ul></article></div>
+          <div class="term"><div class="pane" id="left"></div><div class="pane" id="right"></div><article class="work-overview" id="work-overview" aria-label="Work overview" hidden><h1>AuthPort integration</h1><span class="work-status">● Active</span><p class="work-objective">Move authorization behind a stable port while preserving the provider-neutral Work boundary.</p><section class="route-composer"><label>To</label><select><option>Local Qwen via Ollama</option><option>Claude Code</option><option>ChatGPT · Manual</option><option>OpenAI Coding</option></select><div class="route-detail">Ollama · qwen · Local HTTP<br>Worktree: feature/auth<br>Includes bounded Work and repository context.</div><label>Message</label><textarea rows="4">Implement password reset and verification.</textarea><button class="work-action" type="button">Send to Local Qwen</button></section><div class="work-actions"><button class="work-action" id="work-new-proposal" type="button">Create First Proposal…</button><button class="work-action" id="work-review" type="button">Review Completed Work…</button><button class="work-action" id="work-approve" type="button">Approve Proposal</button><button class="work-action" id="work-reject" type="button">Reject Proposal</button><button class="work-action" id="work-assign" type="button">Assign Approved Work…</button><button class="work-action" id="work-export" type="button">Export Context</button><button class="work-action" id="work-import" type="button">Import Contribution…</button><button class="work-action" id="work-handoff" type="button">Run Assigned Work…</button></div><h2>Coordination</h2><div class="proposal-card"><strong>Proposal · Move authorization into AuthPort</strong>✓ Approved by Randy<small>Execution · Codex · Completed</small><small>Review · Awaiting review</small><small>Next · Review execution</small></div><h2>Proposals</h2><div class="proposal-card"><strong>Move authorization into AuthPort</strong>Proposed · ChatGPT<small>Awaiting review</small></div><h2>Approved</h2><div class="proposal-card"><strong>Keep provider adapters outside Work</strong>Approved · Randy<small>Decision recorded</small></div><h2>Assigned</h2><ul><li>Codex · Add authorization contract tests</li></ul><h2>Active executions</h2><div class="proposal-card"><strong>Implement the approved AuthPort approach</strong>Started · Codex<small>Provider: codex · heartbeat current</small></div><h2>Stale executions</h2><ul><li>None</li></ul><h2>Completed work</h2><ul><li>Codex · Added provider-neutral authorization boundary</li></ul><h2>Failed work</h2><ul><li>None</li></ul><h2>Cancelled work</h2><ul><li>None</li></ul><h2>Conversations</h2><ul class="conversation-list"><li><span>ChatGPT</span><small>Architecture discussion</small><span class="turn-count">2 turns</span></li><li><span>Codex</span><small>Implementation handoff</small><span class="turn-count">3 turns</span></li></ul><h2>Participants</h2><ul><li>Randy · Human</li><li>ChatGPT · Agent</li><li>Codex · Agent</li></ul><h2>Decisions</h2><ul><li>Keep provider adapters outside Work</li></ul></article></div>
           <footer class="status-line" aria-label="Usage status">
             <div class="quota" id="quota">
               <div class="quota-details" id="quota-details" role="region" aria-label="Quota details" tabindex="-1" inert>
@@ -348,6 +359,7 @@
           </footer>
         </section>
         <dialog id="close-confirm"><form method="dialog"><h2>Close terminal?</h2><p>A process is still running in this terminal.</p><div class="actions"><button value="cancel" autofocus>Cancel</button><button value="close">Close</button></div></form></dialog>
+        <dialog id="provider-config"><form method="dialog" class="provider-form"><h2>New OpenAI API Recipient</h2><p>The API key is pasted into a native secure field and stored only in Keychain.</p><label>Provider profile<input value="OpenAI API"></label><label>Recipient<input value="OpenAI"></label><label>Model<select><option>gpt-6-astra</option><option>gpt-5.6-sol</option><option>gpt-5.6-terra</option><option>gpt-5.6-luna</option></select></label><label>API key<input type="password" value="••••••••••••"></label><div class="actions"><button value="cancel">Cancel</button><button value="close">Save</button></div></form></dialog>
         <div class="toast" id="toast" role="status" hidden></div>
       </div>
     </div>
@@ -361,7 +373,7 @@
       <p id="spacing-selection" class="spacing-selection" role="status"></p>
       <div class="spacing-table-wrap"><table><thead><tr><th>ID</th><th>Relationship</th><th>Native source · pt</th><th>Prototype live · px</th><th>Recommended · pt</th></tr></thead><tbody id="spacing-rows"></tbody></table></div>
     </section>
-    <details class="components"><summary>Component contract</summary><p>The native app uses AppKit controls and complete Ghostty surfaces. This page demonstrates chrome states; shell execution, search results, native directory selection, and process confirmation come from the real app. Tabs and workspace selections retain their preview state. See <a href="DESIGN.md">DESIGN.md</a> for the behavior and verification contract.</p><p>Chrome: system font, 12–13 pt. Terminal: Fira Code, Noto Sans Mono CJK SC fallback, 13 pt. Appearance changes colors and materials while font family, size, weight, metrics, and terminal state remain stable.</p></details>
+    <details class="components"><summary>Component contract</summary><p>The native app uses AppKit controls and complete Ghostty surfaces. This page demonstrates chrome states; shell execution, search results, native directory selection, and process confirmation come from the real app. Tabs and workspace selections retain their preview state. The native Work menu exposes Show Work and New Work… even when the sidebar is closed; Toggle Sidebar belongs to View. See <a href="DESIGN.md">DESIGN.md</a> for the behavior and verification contract.</p><p>Chrome: system font, 12–13 pt. Terminal: Fira Code, Noto Sans Mono CJK SC fallback, 13 pt. Appearance changes colors and materials while font family, size, weight, metrics, and terminal state remain stable.</p></details>
   </main>
   <script>
     const repos = [
@@ -412,6 +424,14 @@
 
     function renderList() {
       list.replaceChildren();
+      const workGroup = document.createElement("div");
+      workGroup.className = "group work-group";
+      workGroup.innerHTML = '<div class="group-head"><span>WORK</span><span aria-hidden="true">＋</span></div><div class="rows"><button class="row work-row" data-status="active" type="button"><span class="label">AuthPort password reset</span><span class="work-state">●</span></button><button class="row work-row" data-status="paused" type="button"><span class="label">FeltDB Studio</span><span class="work-state">◐</span></button><button class="row work-row" data-status="completed" type="button"><span class="label">AppBoundary deployment</span><span class="work-state">✓</span></button></div>';
+      workGroup.querySelector("button").addEventListener("click", () => {
+        document.getElementById("component").value = "work";
+        renderTabs();
+      });
+      list.append(workGroup);
       for (const repo of repos) {
         const group = document.createElement("div");
         group.className = "group" + (repo.open ? "" : " shut");
@@ -441,14 +461,6 @@
         group.append(head, rows);
         list.append(group);
       }
-      const workGroup = document.createElement("div");
-      workGroup.className = "group work-group";
-      workGroup.innerHTML = '<div class="group-head"><span>WORK</span></div><div class="rows"><button class="row work-row" type="button"><span class="label">FeltDB integration</span><span class="work-state">Active</span></button></div>';
-      workGroup.querySelector("button").addEventListener("click", () => {
-        document.getElementById("component").value = "work";
-        renderTabs();
-      });
-      list.append(workGroup);
       updateShortcuts();
     }
 
@@ -574,10 +586,13 @@
       const dialog = document.getElementById("close-confirm");
       if (value === "confirm" && !dialog.open) dialog.showModal();
     }
+    const proposalHeading = [...document.querySelectorAll("#work-overview h2")].find(heading => heading.textContent === "Proposals");
+    proposalHeading.before(document.getElementById("chatgpt-participant").content.cloneNode(true));
     document.getElementById("component").addEventListener("change", renderTabs);
     document.getElementById("work-handoff").addEventListener("click", () => showToast("Handoff to Codex in this workspace terminal"));
     document.getElementById("work-export").addEventListener("click", () => showToast("Export Work context in this workspace terminal"));
     document.getElementById("work-import").addEventListener("click", () => showToast("Import an external contribution in this workspace terminal"));
+    for (const [id, message] of [["chatgpt-prepare", "Prepare ChatGPT context"], ["chatgpt-propose", "Prepare a ChatGPT proposal request"], ["chatgpt-review", "Prepare a ChatGPT execution review"], ["chatgpt-import", "Import a copied ChatGPT response"]]) document.getElementById(id).addEventListener("click", () => showToast(message));
     for (const [id, message] of [["work-new-proposal", "Create a proposal in this workspace terminal"], ["work-review", "Review the selected proposal"], ["work-approve", "Approve the selected proposal"], ["work-reject", "Reject the selected proposal"], ["work-assign", "Assign the approved proposal"]]) document.getElementById(id).addEventListener("click", () => showToast(message));
 
     function setMode(next) {

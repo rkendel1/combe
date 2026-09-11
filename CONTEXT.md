@@ -31,6 +31,8 @@ Use these words in code, commits, and docs. If a new domain word sticks, add it 
 | Artifact | A durable reference from a Work to a repository-owned file, patch, commit, report, review, or note. |
 | Handoff | A human-authorized transfer of an Assignment and bounded Work context to a Participant. |
 | Participant adapter | The ephemeral boundary that prepares a provider-neutral Handoff for an installed external execution system. |
+| Conversation participant adapter | A provider-specific, non-durable translator between an external conversation and the Work protocol. It owns no Work state. |
+| ChatGPT participant adapter | The manual-transfer adapter that renders Work protocol context for ChatGPT and translates an explicit response into a provider-neutral Contribution. |
 | FeltDB owner | The one live process owning a local database path. Clones and repeated opens share state inside it; another process is rejected. |
 | Conversation reference | Provider-neutral identity for an external conversation. The provider retains the conversation and its history. |
 | Work conversation | Durable relationship between a Work, Participant, and external Conversation reference. It is not a conversation mirror. |
@@ -43,5 +45,12 @@ Use these words in code, commits, and docs. If a new domain word sticks, add it 
 | Execution result | The bounded canonical outcome of an Execution. Provider transcripts remain external. |
 | Work protocol | The versioned provider-neutral request, context, and contribution vocabulary for a Work. FeltDB remains authoritative. |
 | Execution review | A durable participant evaluation anchored to one Execution and its Assignment. |
+| Work surface | The native projection and explicit controls for one Work's coordination, routed messages, activity, artifacts, and execution environment. It owns no durable state. |
+| Work activity | A bounded deterministic timeline derived from existing Work records. It is not an event store. |
+| Recipient | The explicit destination of a routed Work message. It references one Provider profile and is never inferred from UI history. |
+| Provider profile | Durable, non-secret configuration describing a service, model, capabilities, execution mode, endpoint, and optional Keychain credential reference. |
+| Provider adapter | A service-specific transport behind the provider-neutral Message router. |
+| Message router | Resolves one explicit Recipient and Provider profile, preserves the Work's worktree, invokes exactly one adapter, and records provenance without fallback. |
+| Credential reference | A non-secret stable name persisted in a Provider profile. The referenced credential exists only in macOS Keychain. |
 
-Out of vocabulary: agent session, workbench, desk, execution host, orcad, theme, setting, preference pane.
+Out of vocabulary: agent session, workbench, desk, execution host, orcad, theme, preference pane.

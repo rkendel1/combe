@@ -1,5 +1,11 @@
 # Work coordination protocol
 
+## ChatGPT adapter
+
+`combe work chatgpt <work-id> --action inspect|propose|review` renders this protocol for an addressed ChatGPT Participant. `combe work chatgpt import <work-id> --kind message|proposal|review` translates either an explicit version 2 response envelope or plain text into `WorkContribution`. The envelope is transport syntax, not Work persistence. Its `based_on_revision` is mandatory and the ordinary stale-context rule applies.
+
+Direct transport to an existing ChatGPT conversation is unavailable. Context transfer and response import are explicit user actions. Combe stores no API key, session, cookie, or provider transcript.
+
 Combe Work is the coordination protocol and durable state. AI providers are participants, not owners of the Work. A provider integration translates between its native conversation or action model and this protocol; it must not create a parallel Work model.
 
 ## Package

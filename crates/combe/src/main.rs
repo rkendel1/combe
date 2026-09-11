@@ -1,10 +1,13 @@
+mod chatgpt_adapter;
 mod chrome_view;
 mod cli;
+mod credential_store;
 mod find_bar;
 mod ghostty;
 mod habits;
 mod overview;
 mod participant_adapter;
+mod provider_router;
 mod quota;
 mod quota_panel;
 mod recovery;

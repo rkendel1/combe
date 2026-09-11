@@ -378,14 +378,16 @@ fn git(path: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chatgpt_adapter::{
+        ChatGptAdapter, ConversationParticipantAdapter, ExternalContribution,
+    };
     use chrono::Utc;
     use combe_state::{
         ArtifactId, ArtifactKind, AssignmentId, AssignmentStatus, ContributionAcceptance,
         ContributionKind, ConversationId, ConversationProvider, ConversationRef, ExecutionId,
         ExecutionStatus, FeltDbWorkStore, ParticipantId, ParticipantKind, ParticipantResult,
-        ProposalId, ProposalReview, ProposalStatus, ReviewId, ReviewOutcome, TurnId, TurnKind,
-        TurnOrigin, Work, WorkArtifact, WorkContribution, WorkConversation, WorkExecution, WorkId,
-        WorkProposal, WorkStatus, WorkStore, WorkTurn,
+        ProposalReview, ReviewId, ReviewOutcome, TurnId, TurnKind, TurnOrigin, Work, WorkArtifact,
+        WorkConversation, WorkExecution, WorkId, WorkStatus, WorkStore, WorkTurn,
     };
     use tempfile::TempDir;
 
@@ -522,11 +524,13 @@ mod tests {
         store
             .create_work(context.work.clone(), context.participants.clone())
             .unwrap();
-        let chatgpt = Participant::new(
+        let mut chatgpt = Participant::new(
             context.work.id.clone(),
             ParticipantKind::Agent,
             "ChatGPT".into(),
         );
+        chatgpt.capabilities.can_execute = false;
+        chatgpt.capabilities.can_decide = false;
         store.add_participant(chatgpt.clone()).unwrap();
         let reference = ConversationRef {
             id: "chatgpt-manual-review".into(),
@@ -556,20 +560,37 @@ mod tests {
                 },
             )
             .unwrap();
-        let now = Utc::now();
-        let proposal = WorkProposal {
-            id: ProposalId::new(),
-            work_id: context.work.id.clone(),
-            proposed_by: chatgpt.id.clone(),
-            title: "Preserve the provider-neutral boundary".into(),
-            statement: "Implement the assigned check without coupling Work to a provider.".into(),
-            rationale: None,
-            status: ProposalStatus::Proposed,
-            origin: TurnOrigin::ExternalConversation(reference.clone()),
-            created_at: now,
-            updated_at: now,
+        let proposal_revision = store.current_revision().unwrap();
+        let prepared_proposal = ChatGptAdapter
+            .prepare_context(
+                store.context(&context.work.id).unwrap(),
+                &chatgpt,
+                WorkAction::Propose,
+            )
+            .unwrap();
+        assert_eq!(
+            prepared_proposal.package.request.revision,
+            proposal_revision
+        );
+        let proposal_contribution = ChatGptAdapter
+            .ingest_contribution(ExternalContribution {
+                request: prepared_proposal.package.request,
+                participant: chatgpt.clone(),
+                source: TurnOrigin::ExternalConversation(reference.clone()),
+                explicit_kind: ContributionKind::Proposal,
+                title: Some("Preserve the provider-neutral boundary".into()),
+                proposal_id: None,
+                assignment_id: None,
+                execution_id: None,
+                input: "Implement the assigned check without coupling Work to a provider.".into(),
+            })
+            .unwrap();
+        let ContributionAcceptance::Proposal(proposal_id) =
+            store.accept_contribution(proposal_contribution).unwrap()
+        else {
+            panic!("expected proposal")
         };
-        store.create_proposal(proposal.clone()).unwrap();
+        let proposal = store.load_proposal(&proposal_id).unwrap().unwrap();
         store
             .review_proposal(ProposalReview {
                 id: ReviewId::new(),
@@ -672,25 +693,27 @@ mod tests {
                 }],
             )
             .unwrap();
-        let review_revision = store.current_revision().unwrap();
-        let review = store
-            .accept_contribution(WorkContribution {
-                work_id: assignment.work_id.clone(),
-                participant_id: chatgpt.id,
-                context_version: WORK_CONTEXT_VERSION,
-                based_on_revision: review_revision,
+        let prepared_review = ChatGptAdapter
+            .prepare_context(
+                store.context(&assignment.work_id).unwrap(),
+                &chatgpt,
+                WorkAction::Review,
+            )
+            .unwrap();
+        let review_contribution = ChatGptAdapter
+            .ingest_contribution(ExternalContribution {
+                request: prepared_review.package.request,
+                participant: chatgpt,
                 source: TurnOrigin::ExternalConversation(reference),
-                kind: ContributionKind::Review,
-                content: "ChatGPT confirms the execution satisfies the assignment.".into(),
+                explicit_kind: ContributionKind::Review,
                 title: None,
-                rationale: None,
-                review_outcome: None,
                 proposal_id: None,
                 assignment_id: Some(assignment.id.clone()),
                 execution_id: Some(execution.id.clone()),
-                created_at: Utc::now(),
+                input: "ChatGPT confirms the execution satisfies the assignment.".into(),
             })
             .unwrap();
+        let review = store.accept_contribution(review_contribution).unwrap();
         assert!(matches!(review, ContributionAcceptance::ExecutionReview(_)));
         drop(store);
         let reopened = FeltDbWorkStore::open(database_path).unwrap();

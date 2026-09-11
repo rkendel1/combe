@@ -55,6 +55,7 @@ pub trait WorkStore: Send + Sync {
         Ok(None)
     }
     fn conversations(&self, work_id: &WorkId) -> Result<Vec<WorkConversation>>;
+    fn link_conversation(&self, conversation: WorkConversation) -> Result<()>;
     fn import_contribution(&self, conversation: WorkConversation, turn: WorkTurn) -> Result<()>;
     fn load_conversation(&self, _id: &ConversationId) -> Result<Option<WorkConversation>> {
         Ok(None)

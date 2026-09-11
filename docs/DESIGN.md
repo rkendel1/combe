@@ -1,6 +1,6 @@
 # Combe
 
-Combe is a worktree-aware terminal: a curated repo list on the left, real Ghostty terminals on the right. Click a worktree, land in that directory.
+Combe is a worktree-aware terminal and human/agent coordination application: a curated repo list and explicit Work recipients on the left, real Ghostty terminals and Work coordination on the right. Click a worktree, land in that directory.
 
 Built for personal use, exclusively on Apple Silicon Macs. Private GitHub Releases, no configuration files.
 
@@ -24,7 +24,7 @@ Combe is a lightweight native terminal organized around workspaces. Its mission 
 
 - Restraint in scope: build for the owner's actual daily work on macOS. Do not add features for hypothetical users or pursue a general-purpose terminal product.
 - No compromise on experience: every retained feature should be dependable, easy to use, and consistent with native macOS interactions. A small feature set is no excuse for a poor experience.
-- Do fewer things, and do the needed things well. CLI tools such as Claude Code and Codex run inside terminals; Combe does not become an IDE or an agent management platform.
+- Do fewer things, and do the needed things well. Combe routes explicit Work messages to configured recipients without becoming an IDE or autonomous agent platform.
 
 ### Workspaces
 
@@ -42,7 +42,7 @@ Repos are never discovered by walking the disk.
 
 A workspace may own multiple Works over time. A Work is durable context for a bounded objective; it is not a terminal session, process, provider conversation, task hierarchy, or agent runtime. Combe owns the context and external humans and agents contribute to it. FeltDB is the sole durable authority for Works, participants, turns, assignments, decisions, and artifact references. Repository files remain authoritative for artifact contents.
 
-The sidebar appends a WORK section for the selected workspace. Selecting a Work keeps its workspace terminal available and shows a native read-only overview beside it with title, objective, status, participants, recent turns, active assignments, and decisions. The overview is not a chat surface and does not dispatch or supervise agents.
+The sidebar appends a WORK section scoped to the selected workspace. Selecting a Work keeps its resolved worktree terminal available and shows a native overview beside it with coordination state and an explicitly addressed message composer. It is not a provider transcript and does not autonomously dispatch or supervise agents.
 
 The overview shows Handoff only when an agent participant corresponds to an installed local CLI adapter. Activation asks for the participant when more than one is available, then enters the equivalent `combe work handoff` command into the focused Ghostty surface. The user sees the ordinary external CLI execution. Combe does not retain its PID, PTY, provider session, or terminal output; the command records the provider-neutral result in the Work when execution exits.
 
@@ -68,12 +68,40 @@ The Work overview derives Assigned, Active, Stale, Completed, Failed, and Cancel
 
 Proposal review remains `ProposalReview`. Review of performed work is an `ExecutionReview` anchored to both its Execution and Assignment. The overview's compact COORDINATION section surfaces the linked Proposal approval, Execution state, latest review, and next review action. Providers translate their native model at the protocol boundary; they do not own Work state or create provider-specific review records.
 
+The ChatGPT participant adapter is outside the Work domain. A ChatGPT Recipient uses External Manual delivery: the overview prepares canonical context for transfer and imports explicit responses as `WorkContribution`. A linked provider conversation remains only a `WorkConversation`; Combe does not mirror its transcript or persist credentials.
+
+Work is the first section in the expanded sidebar, above repository and worktree groups. It lists every durable Work with a compact status symbol and attention derived from current proposal, execution, and review records. The heading provides minimal native Work creation. Selecting a Work opens its associated workspace terminal and a restrained native coordination surface; the terminal remains the execution surface.
+
+The Work surface is a bounded projection over existing FeltDB records, with explicit recipient routing and controls for canonical lifecycle mutations. It persists no counters, timeline, notification, next-action, terminal, composer draft, or other UI state. Mutations call existing store operations and reload the projection; stale failures reload before presentation.
+
+The native Work menu is the discoverable entry point independent of sidebar state. Show Work opens the selected Work when possible, otherwise the first active Work, otherwise the first durable Work; with no Work it opens New Work. New Work… opens the same creation flow as the WORK heading action. Toggle Sidebar belongs to View, not Terminal.
+
+The Work surface is task-oriented rather than a record dump. Its top action area shows only operations valid for the current lifecycle state, gives the next operation a persistent button treatment, and uses complete labels. Empty Work explains proposal → approval → assignment → execution → review and offers Create First Proposal… as the primary action. Proposal creation is a native form and writes directly through `WorkStore`; it never stages a partial shell command. Provider context transfer remains explicitly labeled manual.
+
+The visible relationship is Work → coordination UI → Assignment / Execution → Workspace / Worktree → Terminal. Work and Worktree remain separate domain objects.
+
+### Recipient routing
+
+A provider is not a destination. A Recipient is the explicit destination of every outbound Work message. Each Recipient references exactly one Provider profile, and each profile durably records its service, optional model, provider-neutral capabilities, explicit execution mode, optional endpoint, enabled state, and optional non-secret credential reference. The Message router resolves Work → Recipient → Provider profile → Provider adapter and invokes exactly that adapter. It never selects a recipient, model, worktree, or fallback implicitly.
+
+Initial services are Ollama over local HTTP, Claude Code through its PATH-resolved local CLI, consumer ChatGPT through external manual transfer, and OpenAI API through the Responses API. ChatGPT and OpenAI API are visibly and architecturally distinct. Provider-specific request and response types stop at their adapters; routed results and provenance are provider-neutral.
+
+Choosing Ollama prepopulates the local profile name, recipient name, and loopback endpoint. Before presenting the provider form, Combe queries that endpoint's `/api/tags` inventory with a short discovery timeout and offers the returned model names in an editable native combo box. A discovered model is selected by default. If discovery is unavailable, the form stays usable with an explicit model entry and explains that the local service could not be queried; saving never silently substitutes a model. Generation uses the normal bounded provider-request timeout so cold model loading is not mistaken for a connection failure.
+
+Every initial service prepopulates a service-specific profile name and recipient name. Claude Code offers the model aliases reported by its installed CLI contract; ChatGPT prepopulates a conversation label for its manual-transfer profile; OpenAI API offers current documented text-model IDs in an editable model combo box. Model fields remain explicit and editable because account availability can differ. Standard Copy and Paste menu actions target the key window's native field editor whenever a sheet or alert field is active, including secure Keychain credential entry; terminal clipboard actions apply only when no native editor is active.
+
+Work retains its Workspace/worktree anchor. The routing UI always displays both the selected Recipient and the Work's resolved worktree. Direct transports expose Send; External Manual exposes Prepare Context and Import Contribution. Capabilities determine valid operations without provider-name conditionals in the Work UI.
+
+Every routed request carries the same bounded `COMBE_WORK_CONTEXT` projection used by participant handoff, including Work objective and state plus resolved worktree, repository root, and branch. It also includes a bounded orientation snapshot of existing README and primary project-manifest files so transports without filesystem tools can identify the selected project. Symlinks and files resolving outside the worktree are excluded. The composer text is appended as `ROUTED REQUEST`; adapters never receive it as an isolated prompt. Repository files remain authoritative and local execution adapters retain the resolved worktree as their working directory.
+
+Provider profiles, Recipients, routed messages, and bounded results use the existing FeltDB store and stable `combe/provider-profile:*`, `combe/recipient:*`, `combe/message:*`, and `combe/provider-result:*` keys. Credential contents never enter FeltDB, Work context, exports, logs, activity, crash diagnostics, or provider structs. Profiles persist only a `CredentialRef`; the production credential adapter stores its bytes in macOS Keychain under a stable Combe service and account identifier.
+
 ## Non-goals
 
-- Proprietary agents, provider chat overlays, automatic agent dispatch, provider authentication, or process supervision
+- Automatic recipient/model selection, autonomous agent loops, provider chat overlays, OAuth account management, or arbitrary background execution
 - In-app editor, browser, diffs, PR/issue chrome
 - SSH, WSL, remote hosts, a PTY daemon that survives app updates
-- A settings GUI, a theme market, cloud sync, user configuration files
+- A generalized settings GUI, provider marketplace, theme market, cloud sync, or user configuration files
 - Creating or deleting worktrees (that stays with `git` / `gmc`)
 - A hand-written VT parser, glyph atlas, or renderer
 

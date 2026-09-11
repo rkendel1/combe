@@ -1,5 +1,7 @@
+#[cfg(test)]
+use crate::WorkspaceKind;
 use crate::store::WorkspaceStore;
-use crate::{Pane, Result, StateError, Tab, Workspace, WorkspaceKind, WorkspaceState};
+use crate::{Pane, Result, StateError, Tab, Workspace, WorkspaceState};
 use std::path::PathBuf;
 
 /// FeltDbWorkspaceStore provides durable workspace state using the FeltDB Rust crate.

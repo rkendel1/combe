@@ -3,8 +3,16 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
+use crate::chatgpt_adapter::{
+    ChatGptAdapter, ConversationParticipantAdapter, ExternalContribution,
+};
+use crate::credential_store::{Credential, CredentialStore, KeychainCredentialStore};
 use crate::participant_adapter::{
     ContextPackage, LocalCliAdapter, LocalProvider, ParticipantAdapter,
+};
+use crate::provider_router::{
+    ChatGptManualAdapter, ClaudeCodeAdapter, MessageRouter, OllamaAdapter, OpenAiAdapter,
+    RoutingService,
 };
 use chrono::Utc;
 use combe_catalog::{
@@ -12,12 +20,14 @@ use combe_catalog::{
 };
 use combe_state::{
     ArtifactId, ArtifactKind, AssignmentId, AssignmentStatus, ContributionAcceptance,
-    ContributionKind, ConversationId, ConversationProvider, ConversationRef, ExecutionId,
-    ExecutionStatus, FeltDbWorkStore, FeltDbWorkspaceStore, Participant, ParticipantKind,
-    ParticipantResult, ProposalId, ProposalReview, ProposalStatus, ReviewId, ReviewOutcome, TurnId,
-    TurnKind, TurnOrigin, WORK_CONTEXT_VERSION, Work, WorkAction, WorkArtifact, WorkAssignment,
-    WorkContribution, WorkConversation, WorkDecision, WorkExecution, WorkId, WorkProposal,
-    WorkStore, WorkTurn, WorkspaceStore,
+    ContributionKind, ConversationId, ConversationProvider, ConversationRef, CredentialRef,
+    ExecutionId, ExecutionMode, ExecutionStatus, FeltDbWorkStore, FeltDbWorkspaceStore,
+    Participant, ParticipantKind, ParticipantResult, ProposalId, ProposalReview, ProposalStatus,
+    ProviderCapabilities, ProviderProfile, ProviderProfileId, ProviderRegistry, ProviderService,
+    Recipient, RecipientId, ReviewId, ReviewOutcome, TurnId, TurnKind, TurnOrigin,
+    WORK_CONTEXT_VERSION, Work, WorkAction, WorkArtifact, WorkAssignment, WorkContribution,
+    WorkConversation, WorkDecision, WorkExecution, WorkId, WorkProposal, WorkStore, WorkTurn,
+    WorkspaceStore,
 };
 
 const USAGE: &str = "\
@@ -35,6 +45,8 @@ Usage:
   combe work show <id>
   combe work context <id> [--format <text|json>]
   combe work protocol <id> [--participant <name-or-id>] [--action <action>] [--format <text|json>]
+  combe work chatgpt <id> [--action <inspect|propose|review>] [--conversation <id>] [--title <title>]
+  combe work chatgpt import <id> --kind <message|proposal|review> [--revision <revision>] [--execution <id>]
   combe work review <id> --participant <name-or-id> --execution <id> [--revision <revision>]
   combe work decision <id> <statement> [--rationale <text>]
   combe work proposal create <work-id> --participant <name-or-id> --title <title>
@@ -55,6 +67,9 @@ Usage:
   combe work contribute <id> --participant <name-or-id> [--kind <kind>]
   combe work import <id> --participant <name-or-id> --conversation <id> [--provider <provider>] [--title <title>] [--kind <kind>]
   combe work status <work-id> <active|paused|completed|archived>
+  combe provider <list|show|create|enable|disable|delete|test|credential-set|credential-delete> ...
+  combe recipient <list|show|create|enable|disable|delete> ...
+  combe route send <work-id> --to <recipient-id>
   combe version             Show version information
   combe --fresh             Start without restoring previous session
   combe help                Show this help
@@ -80,6 +95,9 @@ pub fn run() -> Option<ExitCode> {
         "open" => Some(open_workspace(rest)),
         "doctor" => Some(doctor()),
         "work" => Some(work(rest)),
+        "provider" => Some(provider(rest)),
+        "recipient" => Some(recipient(rest)),
+        "route" => Some(route(rest)),
         "version" | "-v" | "--version" => Some(version()),
         "--fresh" => None,
         "help" | "-h" | "--help" => {
@@ -109,6 +127,7 @@ fn work(args: &[String]) -> ExitCode {
         "show" => work_show(&store, &args[1..]),
         "context" => work_context(&store, &args[1..]),
         "protocol" => work_protocol(&store, &args[1..]),
+        "chatgpt" => work_chatgpt(&store, &args[1..]),
         "review" => work_review(&store, &args[1..]),
         "decision" => work_decision(&store, &args[1..]),
         "proposal" => work_proposal(&store, &args[1..]),
@@ -135,6 +154,328 @@ fn option(args: &[String], name: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == name)
         .map(|pair| pair[1].clone())
+}
+
+fn provider(args: &[String]) -> ExitCode {
+    let Some(command) = args.first().map(String::as_str) else {
+        eprintln!("combe: provider needs a command");
+        return ExitCode::from(2);
+    };
+    let store = match FeltDbWorkStore::for_combe() {
+        Ok(store) => store,
+        Err(error) => return work_error(error),
+    };
+    let result = match command {
+        "list" => store.list_profiles().map(|profiles| {
+            for profile in profiles {
+                println!(
+                    "{}\t{}\t{:?}\t{}\t{:?}\t{}",
+                    profile.id,
+                    profile.name,
+                    profile.service,
+                    profile.model.as_deref().unwrap_or("-"),
+                    profile.execution_mode,
+                    if profile.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+            }
+        }),
+        "show" => args
+            .get(1)
+            .ok_or_else(|| {
+                combe_state::StateError::InvalidEntity("provider show needs an id".into())
+            })
+            .and_then(|id| store.get_profile(&ProviderProfileId(id.clone())))
+            .map(|profile| {
+                println!("id: {}", profile.id);
+                println!("name: {}", profile.name);
+                println!("service: {:?}", profile.service);
+                println!("model: {}", profile.model.as_deref().unwrap_or("-"));
+                println!("execution: {:?}", profile.execution_mode);
+                println!("endpoint: {}", profile.endpoint.as_deref().unwrap_or("-"));
+                println!(
+                    "credential: {}",
+                    profile
+                        .credential_ref
+                        .as_ref()
+                        .map(|value| value.0.as_str())
+                        .unwrap_or("-")
+                );
+            }),
+        "create" => create_provider(&store, &args[1..]),
+        "enable" | "disable" => set_provider_enabled(&store, &args[1..], command == "enable"),
+        "delete" => args
+            .get(1)
+            .ok_or_else(|| {
+                combe_state::StateError::InvalidEntity("provider delete needs an id".into())
+            })
+            .and_then(|id| store.delete_profile(&ProviderProfileId(id.clone()))),
+        "test" => test_provider(&store, &args[1..]),
+        "credential-set" => set_provider_credential(&args[1..]),
+        "credential-delete" => delete_provider_credential(&args[1..]),
+        other => Err(combe_state::StateError::InvalidEntity(format!(
+            "unknown provider command {other}"
+        ))),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => work_error(error),
+    }
+}
+
+fn set_provider_enabled(
+    store: &FeltDbWorkStore,
+    args: &[String],
+    enabled: bool,
+) -> combe_state::Result<()> {
+    let id = args.first().ok_or_else(|| {
+        combe_state::StateError::InvalidEntity("provider enable/disable needs an id".into())
+    })?;
+    let mut profile = store.get_profile(&ProviderProfileId(id.clone()))?;
+    profile.enabled = enabled;
+    store.update_profile(profile)
+}
+
+fn create_provider(store: &FeltDbWorkStore, args: &[String]) -> combe_state::Result<()> {
+    let name = option(args, "--name").ok_or_else(|| {
+        combe_state::StateError::InvalidEntity("provider create needs --name".into())
+    })?;
+    let service = parse_service(option(args, "--service").as_deref())?;
+    let execution_mode = parse_execution_mode(option(args, "--mode").as_deref())?;
+    let profile = ProviderProfile {
+        id: ProviderProfileId::new(),
+        name,
+        service,
+        model: option(args, "--model"),
+        capabilities: ProviderCapabilities {
+            text_generation: true,
+            code_execution: args.iter().any(|value| value == "--code-execution"),
+            structured_output: args.iter().any(|value| value == "--structured-output"),
+        },
+        execution_mode,
+        credential_ref: option(args, "--credential-ref").map(CredentialRef),
+        endpoint: option(args, "--endpoint"),
+        enabled: true,
+    };
+    store.create_profile(profile.clone())?;
+    println!("{}", profile.id);
+    Ok(())
+}
+
+fn parse_service(value: Option<&str>) -> combe_state::Result<ProviderService> {
+    match value {
+        Some("ollama") => Ok(ProviderService::Ollama),
+        Some("claude_code") => Ok(ProviderService::ClaudeCode),
+        Some("chatgpt") => Ok(ProviderService::ChatGpt),
+        Some("openai_api") => Ok(ProviderService::OpenAiApi),
+        _ => Err(combe_state::StateError::InvalidEntity(
+            "service must be ollama, claude_code, chatgpt, or openai_api".into(),
+        )),
+    }
+}
+
+fn parse_execution_mode(value: Option<&str>) -> combe_state::Result<ExecutionMode> {
+    match value {
+        Some("local_http") => Ok(ExecutionMode::LocalHttp),
+        Some("local_cli") => Ok(ExecutionMode::LocalCli),
+        Some("external_manual") => Ok(ExecutionMode::ExternalManual),
+        Some("http_api") => Ok(ExecutionMode::HttpApi),
+        _ => Err(combe_state::StateError::InvalidEntity(
+            "mode must be local_http, local_cli, external_manual, or http_api".into(),
+        )),
+    }
+}
+
+fn adapters() -> (
+    OllamaAdapter,
+    ClaudeCodeAdapter,
+    ChatGptManualAdapter,
+    OpenAiAdapter,
+) {
+    (
+        OllamaAdapter::new(),
+        ClaudeCodeAdapter,
+        ChatGptManualAdapter,
+        OpenAiAdapter::new(),
+    )
+}
+
+fn test_provider(store: &FeltDbWorkStore, args: &[String]) -> combe_state::Result<()> {
+    let id = args.first().ok_or_else(|| {
+        combe_state::StateError::InvalidEntity("provider test needs an id".into())
+    })?;
+    let profile = store.get_profile(&ProviderProfileId(id.clone()))?;
+    let credentials = KeychainCredentialStore::new();
+    let (ollama, claude, chatgpt, openai) = adapters();
+    let router = RoutingService::new(
+        store,
+        &credentials,
+        vec![&ollama, &claude, &chatgpt, &openai],
+    );
+    let status = router
+        .test_profile(&profile)
+        .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))?;
+    println!("{status}");
+    Ok(())
+}
+
+fn set_provider_credential(args: &[String]) -> combe_state::Result<()> {
+    let reference = args.first().ok_or_else(|| {
+        combe_state::StateError::InvalidEntity("credential-set needs a reference".into())
+    })?;
+    let value = stdin_content()
+        .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))?;
+    if value.trim().is_empty() {
+        return Err(combe_state::StateError::InvalidEntity(
+            "credential cannot be empty".into(),
+        ));
+    }
+    KeychainCredentialStore::new()
+        .set(
+            &CredentialRef(reference.clone()),
+            Credential::new(value.trim().as_bytes()),
+        )
+        .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))
+}
+
+fn delete_provider_credential(args: &[String]) -> combe_state::Result<()> {
+    let reference = args.first().ok_or_else(|| {
+        combe_state::StateError::InvalidEntity("credential-delete needs a reference".into())
+    })?;
+    KeychainCredentialStore::new()
+        .delete(&CredentialRef(reference.clone()))
+        .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))
+}
+
+fn recipient(args: &[String]) -> ExitCode {
+    let Some(command) = args.first().map(String::as_str) else {
+        eprintln!("combe: recipient needs a command");
+        return ExitCode::from(2);
+    };
+    let store = match FeltDbWorkStore::for_combe() {
+        Ok(store) => store,
+        Err(error) => return work_error(error),
+    };
+    let result = match command {
+        "list" => store.list_recipients().map(|recipients| {
+            for recipient in recipients {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    recipient.id,
+                    recipient.name,
+                    recipient.provider_profile_id,
+                    if recipient.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+            }
+        }),
+        "show" => args
+            .get(1)
+            .ok_or_else(|| {
+                combe_state::StateError::InvalidEntity("recipient show needs an id".into())
+            })
+            .and_then(|id| store.get_recipient(&RecipientId(id.clone())))
+            .map(|recipient| {
+                println!("id: {}", recipient.id);
+                println!("name: {}", recipient.name);
+                println!("provider_profile: {}", recipient.provider_profile_id);
+                println!("enabled: {}", recipient.enabled);
+            }),
+        "create" => {
+            let name = option(args, "--name").ok_or_else(|| {
+                combe_state::StateError::InvalidEntity("recipient create needs --name".into())
+            });
+            let profile = option(args, "--provider").ok_or_else(|| {
+                combe_state::StateError::InvalidEntity("recipient create needs --provider".into())
+            });
+            name.and_then(|name| profile.map(|profile| (name, profile)))
+                .and_then(|(name, profile)| {
+                    let recipient = Recipient {
+                        id: RecipientId::new(),
+                        name,
+                        provider_profile_id: ProviderProfileId(profile),
+                        enabled: true,
+                    };
+                    store.create_recipient(recipient.clone())?;
+                    println!("{}", recipient.id);
+                    Ok(())
+                })
+        }
+        "delete" => args
+            .get(1)
+            .ok_or_else(|| {
+                combe_state::StateError::InvalidEntity("recipient delete needs an id".into())
+            })
+            .and_then(|id| store.delete_recipient(&RecipientId(id.clone()))),
+        "enable" | "disable" => args
+            .get(1)
+            .ok_or_else(|| {
+                combe_state::StateError::InvalidEntity(
+                    "recipient enable/disable needs an id".into(),
+                )
+            })
+            .and_then(|id| store.get_recipient(&RecipientId(id.clone())))
+            .and_then(|mut recipient| {
+                recipient.enabled = command == "enable";
+                store.update_recipient(recipient)
+            }),
+        other => Err(combe_state::StateError::InvalidEntity(format!(
+            "unknown recipient command {other}"
+        ))),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => work_error(error),
+    }
+}
+
+fn route(args: &[String]) -> ExitCode {
+    if args.first().map(String::as_str) != Some("send") {
+        eprintln!("combe: route needs send");
+        return ExitCode::from(2);
+    }
+    let Some(work_id) = args.get(1).map(|value| WorkId(value.clone())) else {
+        eprintln!("combe: route send needs a Work id");
+        return ExitCode::from(2);
+    };
+    let Some(recipient_id) = option(args, "--to").map(RecipientId) else {
+        eprintln!("combe: route send needs --to");
+        return ExitCode::from(2);
+    };
+    let message = match stdin_content() {
+        Ok(message) => message,
+        Err(error) => {
+            eprintln!("combe: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    let store = match FeltDbWorkStore::for_combe() {
+        Ok(store) => store,
+        Err(error) => return work_error(error),
+    };
+    let credentials = KeychainCredentialStore::new();
+    let (ollama, claude, chatgpt, openai) = adapters();
+    let router = RoutingService::new(
+        &store,
+        &credentials,
+        vec![&ollama, &claude, &chatgpt, &openai],
+    );
+    match router.send(&work_id, &recipient_id, &message) {
+        Ok(result) => {
+            print!("{}", result.content);
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("combe: {error}");
+            ExitCode::from(1)
+        }
+    }
 }
 
 fn bounded_execution_output(value: String) -> String {
@@ -206,7 +547,7 @@ fn work_show(store: &impl WorkStore, args: &[String]) -> ExitCode {
             println!("{} [{:?}]", context.work.title, context.work.status);
             println!("id: {}", context.work.id);
             println!("workspace: {}", context.work.workspace_id);
-            if let Some(objective) = context.work.objective {
+            if let Some(objective) = &context.work.objective {
                 println!("objective: {objective}");
             }
             println!("participants: {}", context.participants.len());
@@ -222,6 +563,7 @@ fn work_show(store: &impl WorkStore, args: &[String]) -> ExitCode {
             );
             println!("recent results: {}", context.state.recent_results.len());
             println!("executions: {}", context.executions.len());
+            println!("next: {}", crate::work_overview::next_action(&context));
             for execution in &context.executions {
                 println!(
                     "execution {}: {:?} · assignment {} · provider {} · result {}",
@@ -340,6 +682,233 @@ fn work_protocol(store: &impl WorkStore, args: &[String]) -> ExitCode {
         Ok(_) => {
             eprintln!("combe: protocol format must be text or json");
             ExitCode::from(2)
+        }
+        Err(error) => work_error(error),
+    }
+}
+
+fn chatgpt_participant(store: &impl WorkStore, id: &WorkId) -> combe_state::Result<Participant> {
+    if let Some(mut participant) = store.find_participant(id, "ChatGPT")? {
+        let expected = combe_state::ParticipantCapabilities {
+            can_propose: true,
+            can_review: true,
+            can_execute: false,
+            can_decide: false,
+        };
+        if participant.capabilities != expected {
+            participant.capabilities = expected;
+            store.add_participant(participant.clone())?;
+        }
+        return Ok(participant);
+    }
+    let mut participant = Participant::new(id.clone(), ParticipantKind::Agent, "ChatGPT".into());
+    participant.capabilities.can_execute = false;
+    participant.capabilities.can_decide = false;
+    store.add_participant(participant.clone())?;
+    Ok(participant)
+}
+
+fn chatgpt_conversation(
+    store: &impl WorkStore,
+    id: &WorkId,
+    participant: &Participant,
+    external_id: &str,
+    title: Option<String>,
+) -> combe_state::Result<ConversationRef> {
+    if let Some(link) = store.conversations(id)?.into_iter().find(|link| {
+        link.participant_id == participant.id
+            && link.conversation.provider == ConversationProvider::ChatGpt
+            && link.conversation.id == external_id
+    }) {
+        return Ok(link.conversation);
+    }
+    let reference = ConversationRef {
+        id: external_id.into(),
+        provider: ConversationProvider::ChatGpt,
+        title: title.clone(),
+    };
+    store.link_conversation(WorkConversation {
+        id: ConversationId::new(),
+        work_id: id.clone(),
+        conversation: reference.clone(),
+        participant_id: participant.id.clone(),
+        label: title,
+        created_at: Utc::now(),
+    })?;
+    Ok(reference)
+}
+
+fn work_chatgpt(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    if args.first().is_some_and(|arg| arg == "import") {
+        return work_chatgpt_import(store, &args[1..]);
+    }
+    let Some(id) = parse_work_id(args) else {
+        eprintln!("combe: work chatgpt needs a Work id");
+        return ExitCode::from(2);
+    };
+    let result = (|| {
+        let participant = chatgpt_participant(store, &id)?;
+        if let Some(external_id) = option(args, "--conversation") {
+            chatgpt_conversation(
+                store,
+                &id,
+                &participant,
+                &external_id,
+                option(args, "--title"),
+            )?;
+        }
+        let context = store.context(&id)?;
+        let action = protocol_action(option(args, "--action"))?;
+        let prepared = ChatGptAdapter
+            .prepare_context(context, &participant, action)
+            .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))?;
+        prepared.package.request.validate(&participant)?;
+        Ok::<_, combe_state::StateError>(prepared)
+    })();
+    match result {
+        Ok(prepared) => {
+            print!("{}", prepared.rendered);
+            ExitCode::SUCCESS
+        }
+        Err(error) => work_error(error),
+    }
+}
+
+fn chatgpt_contribution_kind(value: Option<String>) -> combe_state::Result<ContributionKind> {
+    match value.as_deref() {
+        Some("message") => Ok(ContributionKind::Message),
+        Some("proposal") => Ok(ContributionKind::Proposal),
+        Some("review") => Ok(ContributionKind::Review),
+        Some("decision") => Ok(ContributionKind::Decision),
+        Some(value) => Err(combe_state::StateError::InvalidEntity(format!(
+            "unsupported ChatGPT contribution kind {value}"
+        ))),
+        None => Err(combe_state::StateError::InvalidEntity(
+            "ChatGPT import needs --kind".into(),
+        )),
+    }
+}
+
+fn structured_revision(input: &str) -> Option<u64> {
+    serde_json::from_str::<serde_json::Value>(input)
+        .ok()?
+        .get("based_on_revision")?
+        .as_u64()
+}
+
+fn work_chatgpt_import(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let Some(id) = parse_work_id(args) else {
+        eprintln!("combe: work chatgpt import needs a Work id");
+        return ExitCode::from(2);
+    };
+    let result = (|| {
+        let participant = store.find_participant(&id, "ChatGPT")?.ok_or_else(|| {
+            combe_state::StateError::InvalidEntity(
+                "no ChatGPT participant is registered; prepare context first".into(),
+            )
+        })?;
+        let kind = chatgpt_contribution_kind(option(args, "--kind"))?;
+        let input = stdin_content()
+            .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))?;
+        let revision = option(args, "--revision")
+            .map(|value| {
+                value.parse::<u64>().map_err(|_| {
+                    combe_state::StateError::InvalidEntity("revision must be an integer".into())
+                })
+            })
+            .transpose()?
+            .or_else(|| structured_revision(&input))
+            .ok_or_else(|| {
+                combe_state::StateError::InvalidEntity(
+                    "plain-text ChatGPT import needs --revision from the prepared context".into(),
+                )
+            })?;
+        let action = match kind {
+            ContributionKind::Proposal => WorkAction::Propose,
+            ContributionKind::Review => WorkAction::Review,
+            ContributionKind::Message => WorkAction::Inspect,
+            ContributionKind::Decision => WorkAction::Decide,
+            _ => {
+                return Err(combe_state::StateError::InvalidEntity(
+                    "unsupported ChatGPT contribution kind".into(),
+                ));
+            }
+        };
+        let source = if let Some(external_id) = option(args, "--conversation") {
+            let reference = store
+                .conversations(&id)?
+                .into_iter()
+                .find(|link| {
+                    link.participant_id == participant.id
+                        && link.conversation.provider == ConversationProvider::ChatGpt
+                        && link.conversation.id == external_id
+                })
+                .map(|link| link.conversation)
+                .ok_or_else(|| {
+                    combe_state::StateError::InvalidEntity(
+                        "ChatGPT conversation is not linked; prepare context with --conversation first"
+                            .into(),
+                    )
+                })?;
+            TurnOrigin::ExternalConversation(reference)
+        } else {
+            TurnOrigin::Local
+        };
+        let context = store.context(&id)?;
+        let requested_execution = option(args, "--execution").map(ExecutionId);
+        let execution = requested_execution
+            .as_ref()
+            .and_then(|execution_id| {
+                context
+                    .executions
+                    .iter()
+                    .find(|execution| execution.id == *execution_id)
+            })
+            .or_else(|| {
+                (kind == ContributionKind::Review)
+                    .then(|| context.executions.last())
+                    .flatten()
+            });
+        if kind == ContributionKind::Review
+            && execution.is_none()
+            && option(args, "--proposal").is_none()
+        {
+            return Err(combe_state::StateError::InvalidEntity(
+                "ChatGPT review needs an execution or proposal reference".into(),
+            ));
+        }
+        let request = combe_state::WorkRequest {
+            work_id: id,
+            participant_id: participant.id.clone(),
+            context_version: WORK_CONTEXT_VERSION,
+            revision,
+            requested_action: action,
+        };
+        let contribution = ChatGptAdapter
+            .ingest_contribution(ExternalContribution {
+                request,
+                participant,
+                source,
+                explicit_kind: kind,
+                title: option(args, "--title"),
+                proposal_id: option(args, "--proposal").map(ProposalId),
+                assignment_id: execution.map(|execution| execution.assignment_id.clone()),
+                execution_id: execution.map(|execution| execution.id.clone()),
+                input,
+            })
+            .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))?;
+        store.accept_contribution(contribution)
+    })();
+    match result {
+        Ok(accepted) => {
+            match accepted {
+                ContributionAcceptance::Turn(id) => println!("{id}"),
+                ContributionAcceptance::Proposal(id) => println!("{id}"),
+                ContributionAcceptance::ProposalReview(id) => println!("{id}"),
+                ContributionAcceptance::ExecutionReview(id) => println!("{id}"),
+                ContributionAcceptance::Decision(id) => println!("{id}"),
+            }
+            ExitCode::SUCCESS
         }
         Err(error) => work_error(error),
     }
@@ -789,26 +1358,30 @@ fn work_import(store: &impl WorkStore, args: &[String]) -> ExitCode {
         Err(error) => return work_error(error),
     };
     let result = (|| {
+        let provider = conversation_provider(
+            option(args, "--provider")
+                .as_deref()
+                .unwrap_or(&participant_value),
+        );
         let participant = match store.participants(&id)?.into_iter().find(|candidate| {
             candidate.id.0 == participant_value
                 || candidate.name.eq_ignore_ascii_case(&participant_value)
         }) {
             Some(participant) => participant,
             None => {
-                let participant = Participant::new(
+                let mut participant = Participant::new(
                     id.clone(),
                     ParticipantKind::Agent,
                     participant_value.clone(),
                 );
+                if provider == ConversationProvider::ChatGpt {
+                    participant.capabilities.can_execute = false;
+                    participant.capabilities.can_decide = false;
+                }
                 store.add_participant(participant.clone())?;
                 participant
             }
         };
-        let provider = conversation_provider(
-            option(args, "--provider")
-                .as_deref()
-                .unwrap_or(&participant_value),
-        );
         let requested_reference = ConversationRef {
             id: conversation_id,
             provider,

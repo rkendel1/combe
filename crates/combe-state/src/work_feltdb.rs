@@ -16,14 +16,181 @@ use crate::work_store::{
 use crate::{
     ArtifactId, AssignmentId, AssignmentStatus, ContributionAcceptance, ContributionKind,
     ConversationId, ExecutionId, ExecutionReview, ExecutionReviewId, ExecutionStatus, Participant,
-    ParticipantId, ParticipantResult, ProposalId, ProposalReview, ProposalStatus, Result, ReviewId,
-    ReviewOutcome, StateError, TurnId, TurnKind, TurnOrigin, WORK_CONTEXT_VERSION, Work,
+    ParticipantId, ParticipantResult, ProposalId, ProposalReview, ProposalStatus, ProviderProfile,
+    ProviderProfileId, ProviderRegistry, Recipient, RecipientId, Result, ReviewId, ReviewOutcome,
+    RoutedProviderResult, StateError, TurnId, TurnKind, TurnOrigin, WORK_CONTEXT_VERSION, Work,
     WorkArtifact, WorkAssignment, WorkContext, WorkContribution, WorkConversation, WorkDecision,
     WorkExecution, WorkId, WorkProposal, WorkState, WorkStatus, WorkStore, WorkTurn,
 };
 
 pub struct FeltDbWorkStore {
     db: feltdb::FeltDb,
+}
+
+impl ProviderRegistry for FeltDbWorkStore {
+    fn list_profiles(&self) -> Result<Vec<ProviderProfile>> {
+        let mut profiles = self.scan::<ProviderProfile>("provider-profile")?;
+        profiles.sort_by(|left, right| left.name.cmp(&right.name).then(left.id.0.cmp(&right.id.0)));
+        Ok(profiles)
+    }
+
+    fn get_profile(&self, id: &ProviderProfileId) -> Result<ProviderProfile> {
+        self.get("provider-profile", &id.0)?
+            .ok_or_else(|| StateError::NotFound {
+                entity_type: "provider-profile".into(),
+                id: id.0.clone(),
+            })
+    }
+
+    fn create_profile(&self, profile: ProviderProfile) -> Result<()> {
+        profile.validate()?;
+        self.atomic(
+            vec![Self::mutation("provider-profile", &profile.id.0, &profile)?],
+            vec![Self::absent("provider-profile", &profile.id.0)],
+        )
+    }
+
+    fn update_profile(&self, profile: ProviderProfile) -> Result<()> {
+        profile.validate()?;
+        let version = self.version("provider-profile", &profile.id.0)?;
+        self.atomic(
+            vec![Self::mutation("provider-profile", &profile.id.0, &profile)?],
+            vec![Self::at_version("provider-profile", &profile.id.0, version)],
+        )
+    }
+
+    fn delete_profile(&self, id: &ProviderProfileId) -> Result<()> {
+        if self
+            .list_recipients()?
+            .iter()
+            .any(|recipient| recipient.provider_profile_id == *id)
+        {
+            return Err(StateError::InvalidEntity(
+                "provider profile is still used by a recipient".into(),
+            ));
+        }
+        self.get_profile(id)?;
+        self.db
+            .delete(&Self::key("provider-profile", &id.0))
+            .map_err(|error| StateError::FeltDbError(error.to_string()))
+    }
+
+    fn list_recipients(&self) -> Result<Vec<Recipient>> {
+        let mut recipients = self.scan::<Recipient>("recipient")?;
+        recipients
+            .sort_by(|left, right| left.name.cmp(&right.name).then(left.id.0.cmp(&right.id.0)));
+        Ok(recipients)
+    }
+
+    fn get_recipient(&self, id: &RecipientId) -> Result<Recipient> {
+        self.get("recipient", &id.0)?
+            .ok_or_else(|| StateError::NotFound {
+                entity_type: "recipient".into(),
+                id: id.0.clone(),
+            })
+    }
+
+    fn create_recipient(&self, recipient: Recipient) -> Result<()> {
+        validate_recipient(self, &recipient)?;
+        self.atomic(
+            vec![Self::mutation("recipient", &recipient.id.0, &recipient)?],
+            vec![Self::absent("recipient", &recipient.id.0)],
+        )
+    }
+
+    fn update_recipient(&self, recipient: Recipient) -> Result<()> {
+        validate_recipient(self, &recipient)?;
+        let version = self.version("recipient", &recipient.id.0)?;
+        self.atomic(
+            vec![Self::mutation("recipient", &recipient.id.0, &recipient)?],
+            vec![Self::at_version("recipient", &recipient.id.0, version)],
+        )
+    }
+
+    fn delete_recipient(&self, id: &RecipientId) -> Result<()> {
+        self.get_recipient(id)?;
+        self.db
+            .delete(&Self::key("recipient", &id.0))
+            .map_err(|error| StateError::FeltDbError(error.to_string()))
+    }
+
+    fn add_message(&self, message: crate::WorkMessage) -> Result<()> {
+        self.require_work(&message.work_id)?;
+        self.validate_participant(&message.work_id, &message.sender_participant_id)?;
+        let recipient = self.get_recipient(&message.recipient_id)?;
+        if !recipient.enabled {
+            return Err(StateError::InvalidEntity("recipient is disabled".into()));
+        }
+        if message.content.trim().is_empty() {
+            return Err(StateError::InvalidEntity("message cannot be empty".into()));
+        }
+        self.atomic(
+            vec![Self::mutation("message", &message.id.0, &message)?],
+            vec![Self::absent("message", &message.id.0)],
+        )
+    }
+
+    fn messages(&self, work_id: &WorkId) -> Result<Vec<crate::WorkMessage>> {
+        self.require_work(work_id)?;
+        let mut messages = self
+            .scan::<crate::WorkMessage>("message")?
+            .into_iter()
+            .filter(|message| message.work_id == *work_id)
+            .collect::<Vec<_>>();
+        messages.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then(left.id.0.cmp(&right.id.0))
+        });
+        Ok(messages)
+    }
+
+    fn add_provider_result(&self, result: RoutedProviderResult) -> Result<()> {
+        self.require_work(&result.work_id)?;
+        let message = self
+            .get::<crate::WorkMessage>("message", &result.message_id.0)?
+            .ok_or_else(|| StateError::NotFound {
+                entity_type: "message".into(),
+                id: result.message_id.0.clone(),
+            })?;
+        if message.work_id != result.work_id
+            || message.recipient_id != result.recipient_id
+            || message.provider_profile_id != result.provider_profile_id
+        {
+            return Err(StateError::InvalidEntity(
+                "provider result provenance does not match its message".into(),
+            ));
+        }
+        self.atomic(
+            vec![Self::mutation(
+                "provider-result",
+                &result.message_id.0,
+                &result,
+            )?],
+            vec![Self::absent("provider-result", &result.message_id.0)],
+        )
+    }
+
+    fn provider_results(&self, work_id: &WorkId) -> Result<Vec<RoutedProviderResult>> {
+        self.require_work(work_id)?;
+        let mut results = self
+            .scan::<RoutedProviderResult>("provider-result")?
+            .into_iter()
+            .filter(|result| result.work_id == *work_id)
+            .collect::<Vec<_>>();
+        results.sort_by_key(|result| result.created_at);
+        Ok(results)
+    }
+}
+
+fn validate_recipient(store: &FeltDbWorkStore, recipient: &Recipient) -> Result<()> {
+    if recipient.name.trim().is_empty() {
+        return Err(StateError::InvalidEntity(
+            "recipient name cannot be empty".into(),
+        ));
+    }
+    store.get_profile(&recipient.provider_profile_id)?;
+    Ok(())
 }
 
 impl FeltDbWorkStore {
@@ -416,14 +583,13 @@ impl WorkStore for FeltDbWorkStore {
             .collect::<Vec<_>>();
         let active_assignments = assignments
             .iter()
-            .cloned()
-            .into_iter()
             .filter(|assignment| {
                 matches!(
                     assignment.status,
                     AssignmentStatus::Pending | AssignmentStatus::Active
                 )
             })
+            .cloned()
             .collect::<Vec<_>>();
         let decisions = self
             .decisions(work_id)?
@@ -595,6 +761,28 @@ impl WorkStore for FeltDbWorkStore {
                 .then_with(|| left.id.0.cmp(&right.id.0))
         });
         Ok(values)
+    }
+
+    fn link_conversation(&self, conversation: WorkConversation) -> Result<()> {
+        self.require_work(&conversation.work_id)?;
+        self.load_participant(&conversation.participant_id)?
+            .filter(|participant| participant.work_id == conversation.work_id)
+            .ok_or_else(|| {
+                StateError::InvalidEntity("participant does not belong to Work".into())
+            })?;
+        if conversation.conversation.id.trim().is_empty() {
+            return Err(StateError::InvalidEntity(
+                "external conversation identifier cannot be empty".into(),
+            ));
+        }
+        self.atomic(
+            vec![Self::mutation(
+                "work-conversation",
+                &conversation.id.0,
+                &conversation,
+            )?],
+            vec![Self::absent("work-conversation", &conversation.id.0)],
+        )
     }
 
     fn import_contribution(&self, conversation: WorkConversation, turn: WorkTurn) -> Result<()> {
@@ -1339,6 +1527,27 @@ mod tests {
     }
 
     #[test]
+    fn conversation_link_round_trips_without_mirroring_a_transcript() {
+        let (store, _directory) = store();
+        let (work, _, participant) = work_with_participants(&store);
+        let conversation = WorkConversation {
+            id: ConversationId::new(),
+            work_id: work.id.clone(),
+            conversation: ConversationRef {
+                id: "chatgpt-conversation-1".into(),
+                provider: ConversationProvider::ChatGpt,
+                title: Some("Architecture review".into()),
+            },
+            participant_id: participant.id,
+            label: Some("Architecture review".into()),
+            created_at: Utc::now(),
+        };
+        store.link_conversation(conversation.clone()).unwrap();
+        assert_eq!(store.conversations(&work.id).unwrap(), vec![conversation]);
+        assert!(store.context(&work.id).unwrap().recent_turns.is_empty());
+    }
+
+    #[test]
     fn same_process_work_stores_share_current_state() {
         let directory = TempDir::new().unwrap();
         let path = directory.path().join("work.db");
@@ -1555,6 +1764,45 @@ mod tests {
             store.context(&work.id).unwrap().conversations.len(),
             CONTEXT_CONVERSATION_LIMIT
         );
+    }
+
+    #[test]
+    fn provider_registry_and_recipients_persist_without_secrets() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("work.db");
+        let profile = ProviderProfile {
+            id: ProviderProfileId("profile-1".into()),
+            name: "OpenAI Coding".into(),
+            service: crate::ProviderService::OpenAiApi,
+            model: Some("configured-model".into()),
+            capabilities: crate::ProviderCapabilities {
+                text_generation: true,
+                code_execution: false,
+                structured_output: true,
+            },
+            execution_mode: crate::ExecutionMode::HttpApi,
+            credential_ref: Some(crate::CredentialRef("openai/default".into())),
+            endpoint: None,
+            enabled: true,
+        };
+        let recipient = Recipient {
+            id: RecipientId("recipient-1".into()),
+            name: "Frontier reviewer".into(),
+            provider_profile_id: profile.id.clone(),
+            enabled: true,
+        };
+        {
+            let store = FeltDbWorkStore::open(&path).unwrap();
+            store.create_profile(profile.clone()).unwrap();
+            store.create_recipient(recipient.clone()).unwrap();
+            assert!(store.delete_profile(&profile.id).is_err());
+        }
+        let store = FeltDbWorkStore::open(path).unwrap();
+        assert_eq!(store.get_profile(&profile.id).unwrap(), profile);
+        assert_eq!(store.get_recipient(&recipient.id).unwrap(), recipient);
+        let serialized = serde_json::to_string(&store.list_profiles().unwrap()).unwrap();
+        assert!(serialized.contains("openai/default"));
+        assert!(!serialized.contains("sk-"));
     }
 
     fn proposal(work: &Work, participant: &Participant, status: ProposalStatus) -> WorkProposal {

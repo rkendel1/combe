@@ -748,7 +748,7 @@ fn event_characters(event: &NSEvent) -> Option<String> {
 
 fn key_event_text(text: &str) -> Option<&str> {
     let first = text.chars().next()?;
-    if first.is_ascii() && (first as u32) < 0x20 {
+    if first.is_ascii_control() {
         return None;
     }
     Some(text)
@@ -774,5 +774,23 @@ fn momentum(phase: NSEventPhase) -> u8 {
         NSEventPhase::Cancelled => 5,
         NSEventPhase::MayBegin => 6,
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_event_text;
+
+    #[test]
+    fn physical_control_keys_do_not_send_text() {
+        assert_eq!(key_event_text("\u{7f}"), None);
+        assert_eq!(key_event_text("\r"), None);
+        assert_eq!(key_event_text("\u{1b}"), None);
+    }
+
+    #[test]
+    fn printable_input_keeps_its_text() {
+        assert_eq!(key_event_text("a"), Some("a"));
+        assert_eq!(key_event_text("é"), Some("é"));
     }
 }
