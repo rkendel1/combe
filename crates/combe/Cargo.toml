@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 block2 = "0.6"
 combe-catalog = { path = "../combe-catalog" }
+combe-state = { path = "../combe-state" }
 ghostty-sys = { path = "../ghostty-sys" }
 objc2 = "0.6"
 objc2-app-kit = "0.3"
