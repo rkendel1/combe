@@ -508,6 +508,22 @@ mod tests {
     }
 
     #[test]
+    fn same_process_work_stores_share_current_state() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("work.db");
+        let gui = FeltDbWorkStore::open(&path).unwrap();
+        let (work, _, _) = work_with_participants(&gui);
+        let cli = FeltDbWorkStore::open(&path).unwrap();
+        assert_eq!(cli.load_work(&work.id).unwrap(), Some(work.clone()));
+        cli.set_work_status(&work.id, WorkStatus::Completed)
+            .unwrap();
+        assert_eq!(
+            gui.load_work(&work.id).unwrap().unwrap().status,
+            WorkStatus::Completed
+        );
+    }
+
+    #[test]
     fn turns_assignments_decisions_and_artifacts_reconstruct_context() {
         let (store, _directory) = store();
         let (work, human, agent) = work_with_participants(&store);

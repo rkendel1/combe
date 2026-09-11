@@ -1050,6 +1050,8 @@ fn choose_handoff(id: &WorkId) {
     let Some((_, participant, provider)) = options.get(index) else {
         return;
     };
+    drop(context);
+    drop(store);
     let Ok(executable) = std::env::current_exe() else {
         return;
     };
