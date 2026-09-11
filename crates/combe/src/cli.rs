@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use combe_catalog::{
     Catalog, State, add_repo, catalog, cleanup, load_state, remove_repo, save_state, state_path,
 };
+use combe_state::{FeltDbWorkspaceStore, WorkspaceStore};
 
 const USAGE: &str = "\
 combe — a worktree-aware terminal
@@ -14,6 +15,10 @@ Usage:
   combe add <path>...       Register repos
   combe remove <path>...    Unregister repos
   combe cleanup             Drop registered paths that no longer exist on disk
+  combe open <path>         Open or focus a workspace
+  combe doctor              Check Combe installation and state
+  combe version             Show version information
+  combe --fresh             Start without restoring previous session
   combe help                Show this help
 
 The window opens from the Dock, Finder, or `open -a Combe`.
@@ -34,6 +39,10 @@ pub fn run() -> Option<ExitCode> {
         "add" => Some(add(rest)),
         "remove" => Some(remove(rest)),
         "cleanup" => Some(clean()),
+        "open" => Some(open_workspace(rest)),
+        "doctor" => Some(doctor()),
+        "version" | "-v" | "--version" => Some(version()),
+        "--fresh" => None,
         "help" | "-h" | "--help" => {
             print_usage();
             Some(ExitCode::SUCCESS)
@@ -182,4 +191,109 @@ fn read_state() -> Option<State> {
             None
         }
     }
+}
+
+fn open_workspace(paths: &[String]) -> ExitCode {
+    if paths.is_empty() {
+        eprintln!("combe: open needs a path");
+        return ExitCode::from(2);
+    }
+    let path = &paths[0];
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => {
+            println!("Opening workspace: {}", canonical.display());
+            ExitCode::SUCCESS
+        }
+        Err(err) => {
+            eprintln!("combe: cannot access {}: {}", path, err);
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn doctor() -> ExitCode {
+    println!("Combe diagnostics:\n");
+
+    match std::env::consts::ARCH {
+        "aarch64" => println!("  Architecture: Apple Silicon (arm64)"),
+        "x86_64" => println!("  Architecture: Intel (x86_64)"),
+        other => println!("  Architecture: {}", other),
+    }
+
+    match which::which("git") {
+        Ok(path) => {
+            match std::process::Command::new("git")
+                .arg("--version")
+                .output()
+            {
+                Ok(output) => {
+                    let version = String::from_utf8_lossy(&output.stdout);
+                    println!("  Git: {} ({})", version.trim(), path.display());
+                }
+                Err(_) => println!("  Git: found but cannot execute"),
+            }
+        }
+        Err(_) => println!("  Git: not found"),
+    }
+
+    match which::which("ghostty") {
+        Ok(path) => println!("  Ghostty: {}", path.display()),
+        Err(_) => println!("  Ghostty: not found in PATH"),
+    }
+
+    if let Some(state_path) = state_path() {
+        match std::fs::metadata(&state_path) {
+            Ok(meta) => {
+                println!("  Catalog state: {} ({} bytes)", state_path.display(), meta.len());
+            }
+            Err(_) => println!("  Catalog state: {} (will be created)", state_path.display()),
+        }
+    } else {
+        println!("  Catalog state: cannot determine location");
+    }
+
+    let Some(state) = read_state() else {
+        eprintln!("combe: failed to read catalog state");
+        return ExitCode::FAILURE;
+    };
+    println!("  Registered repos: {}", state.repos.len());
+    for repo in &state.repos {
+        if repo.path.is_dir() {
+            println!("    ✓ {}", repo.path.display());
+        } else {
+            println!("    ✗ {} (missing)", repo.path.display());
+        }
+    }
+
+    println!("\n  Workspace state:");
+    match FeltDbWorkspaceStore::for_combe() {
+        Ok(store) => {
+            match store.load_state() {
+                Ok(ws_state) => {
+                    println!("    Workspaces: {}", ws_state.workspaces.len());
+                    for ws in &ws_state.workspaces {
+                        if std::path::Path::new(&ws.path).is_dir() {
+                            println!("      ✓ {} ({})", ws.id, ws.path);
+                        } else {
+                            println!("      ✗ {} (missing: {})", ws.id, ws.path);
+                        }
+                    }
+                    if let Some(selected) = &ws_state.selected_workspace_id {
+                        println!("    Selected: {}", selected);
+                    }
+                }
+                Err(err) => println!("    Error reading state: {}", err),
+            }
+        }
+        Err(err) => println!("    Error: {}", err),
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn version() -> ExitCode {
+    let version = env!("CARGO_PKG_VERSION");
+    println!("Combe {}", version);
+    println!("Built for: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+    ExitCode::SUCCESS
 }

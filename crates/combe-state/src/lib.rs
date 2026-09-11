@@ -1,22 +1,19 @@
 pub mod error;
 pub mod store;
-pub mod protocol;
-pub mod transport;
-pub mod client;
 pub mod feltdb;
 pub mod migration;
 pub mod memory;
+pub mod filestore;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub use error::{StateError, Result};
 pub use store::WorkspaceStore;
-pub use client::FeltDbLocalClient;
-pub use protocol::RuntimeConfig;
 pub use feltdb::FeltDbWorkspaceStore;
 pub use migration::migrate_from_json;
 pub use memory::InMemoryWorkspaceStore;
+pub use filestore::FileWorkspaceStore;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum WorkspaceKind {
@@ -30,7 +27,7 @@ pub enum WorkspaceKind {
     Worktree,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: String,
     pub kind: WorkspaceKind,
@@ -59,7 +56,7 @@ pub enum SplitDirection {
     Vertical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Pane {
     pub id: String,
     pub tab_id: String,
@@ -84,7 +81,7 @@ impl Pane {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tab {
     pub id: String,
     pub workspace_id: String,

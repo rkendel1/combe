@@ -22,6 +22,8 @@ pub enum StoreError {
 pub struct State {
     #[serde(default)]
     pub repos: Vec<Repo>,
+    #[serde(default)]
+    pub version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
