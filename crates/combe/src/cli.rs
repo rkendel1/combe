@@ -5,7 +5,7 @@ use std::process::ExitCode;
 use combe_catalog::{
     Catalog, State, add_repo, catalog, cleanup, load_state, remove_repo, save_state, state_path,
 };
-use combe_state::{FileWorkspaceStore, WorkspaceStore};
+use combe_state::{FeltDbWorkspaceStore, WorkspaceStore};
 
 const USAGE: &str = "\
 combe — a worktree-aware terminal
@@ -266,7 +266,7 @@ fn doctor() -> ExitCode {
     }
 
     println!("\n  Workspace state:");
-    match FileWorkspaceStore::for_combe() {
+    match FeltDbWorkspaceStore::for_combe() {
         Ok(store) => {
             match store.load_state() {
                 Ok(ws_state) => {

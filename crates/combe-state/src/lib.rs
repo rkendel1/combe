@@ -1,8 +1,5 @@
 pub mod error;
 pub mod store;
-pub mod protocol;
-pub mod transport;
-pub mod client;
 pub mod feltdb;
 pub mod migration;
 pub mod memory;
@@ -13,8 +10,6 @@ use uuid::Uuid;
 
 pub use error::{StateError, Result};
 pub use store::WorkspaceStore;
-pub use client::FeltDbLocalClient;
-pub use protocol::RuntimeConfig;
 pub use feltdb::FeltDbWorkspaceStore;
 pub use migration::migrate_from_json;
 pub use memory::InMemoryWorkspaceStore;
