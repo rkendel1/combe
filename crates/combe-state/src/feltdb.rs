@@ -1,8 +1,6 @@
-use crate::{Pane, Result, StateError, Tab, Workspace, WorkspaceState};
+use crate::{Pane, Result, StateError, Tab, Workspace, WorkspaceState, WorkspaceKind};
 use crate::store::WorkspaceStore;
-use feltdb::AtomicMutation;
 use std::path::PathBuf;
-use uuid::Uuid;
 
 /// FeltDbWorkspaceStore provides durable workspace state using the FeltDB Rust crate.
 ///
@@ -16,28 +14,9 @@ pub struct FeltDbWorkspaceStore {
     db: feltdb::FeltDb,
 }
 
-/// Wrapper types for storing records in FeltDB with proper serialization.
-/// These wrap the Combe types to include metadata as needed.
+/// Session metadata stored in FeltDB.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-struct StoredWorkspace {
-    #[serde(flatten)]
-    workspace: Workspace,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-struct StoredTab {
-    #[serde(flatten)]
-    tab: Tab,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-struct StoredPane {
-    #[serde(flatten)]
-    pane: Pane,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
-struct StoredSessionMetadata {
+struct SessionMetadata {
     workspace_id: Option<String>,
 }
 
@@ -70,7 +49,7 @@ impl WorkspaceStore for FeltDbWorkspaceStore {
         // Load session metadata
         let selected_workspace_id = self
             .db
-            .query(|_: &StoredSessionMetadata| true)
+            .query(|_: &SessionMetadata| true)
             .map_err(|e| StateError::FeltDbError(format!("Query failed: {}", e)))?
             .into_iter()
             .next()
@@ -83,39 +62,30 @@ impl WorkspaceStore for FeltDbWorkspaceStore {
     }
 
     fn save_workspace(&self, workspace: Workspace) -> Result<()> {
-        let stored = StoredWorkspace { workspace };
-        let key = format!("workspace:{}", stored.workspace.id);
-        let value = serde_json::to_value(&stored)
-            .map_err(|e| StateError::FeltDbError(format!("Serialization failed: {}", e)))?;
+        let key = format!("workspace:{}", workspace.id);
 
         self.db
-            .insert(&key, value)
+            .insert(&key, workspace)
             .map_err(|e| StateError::FeltDbError(format!("Insert failed: {}", e)))?;
 
         Ok(())
     }
 
     fn save_tab(&self, tab: Tab) -> Result<()> {
-        let stored = StoredTab { tab };
-        let key = format!("tab:{}", stored.tab.id);
-        let value = serde_json::to_value(&stored)
-            .map_err(|e| StateError::FeltDbError(format!("Serialization failed: {}", e)))?;
+        let key = format!("tab:{}", tab.id);
 
         self.db
-            .insert(&key, value)
+            .insert(&key, tab)
             .map_err(|e| StateError::FeltDbError(format!("Insert failed: {}", e)))?;
 
         Ok(())
     }
 
     fn save_pane(&self, pane: Pane) -> Result<()> {
-        let stored = StoredPane { pane };
-        let key = format!("pane:{}", stored.pane.id);
-        let value = serde_json::to_value(&stored)
-            .map_err(|e| StateError::FeltDbError(format!("Serialization failed: {}", e)))?;
+        let key = format!("pane:{}", pane.id);
 
         self.db
-            .insert(&key, value)
+            .insert(&key, pane)
             .map_err(|e| StateError::FeltDbError(format!("Insert failed: {}", e)))?;
 
         Ok(())
@@ -125,59 +95,59 @@ impl WorkspaceStore for FeltDbWorkspaceStore {
         let id = id.to_string();
         let results = self
             .db
-            .query(|stored: &StoredWorkspace| stored.workspace.id == id)
+            .query(|workspace: &Workspace| workspace.id == id)
             .map_err(|e| StateError::FeltDbError(format!("Query failed: {}", e)))?;
 
-        Ok(results.into_iter().next().map(|stored| stored.workspace))
+        Ok(results.into_iter().next())
     }
 
     fn load_tab(&self, id: &str) -> Result<Option<Tab>> {
         let id = id.to_string();
         let results = self
             .db
-            .query(|stored: &StoredTab| stored.tab.id == id)
+            .query(|tab: &Tab| tab.id == id)
             .map_err(|e| StateError::FeltDbError(format!("Query failed: {}", e)))?;
 
-        Ok(results.into_iter().next().map(|stored| stored.tab))
+        Ok(results.into_iter().next())
     }
 
     fn load_pane(&self, id: &str) -> Result<Option<Pane>> {
         let id = id.to_string();
         let results = self
             .db
-            .query(|stored: &StoredPane| stored.pane.id == id)
+            .query(|pane: &Pane| pane.id == id)
             .map_err(|e| StateError::FeltDbError(format!("Query failed: {}", e)))?;
 
-        Ok(results.into_iter().next().map(|stored| stored.pane))
+        Ok(results.into_iter().next())
     }
 
     fn list_workspaces(&self) -> Result<Vec<Workspace>> {
         let results = self
             .db
-            .query(|_: &StoredWorkspace| true)
+            .query(|_: &Workspace| true)
             .map_err(|e| StateError::FeltDbError(format!("Query failed: {}", e)))?;
 
-        Ok(results.into_iter().map(|stored| stored.workspace).collect())
+        Ok(results)
     }
 
     fn list_tabs(&self, workspace_id: &str) -> Result<Vec<Tab>> {
         let workspace_id = workspace_id.to_string();
         let results = self
             .db
-            .query(move |stored: &StoredTab| stored.tab.workspace_id == workspace_id)
+            .query(move |tab: &Tab| tab.workspace_id == workspace_id)
             .map_err(|e| StateError::FeltDbError(format!("Query failed: {}", e)))?;
 
-        Ok(results.into_iter().map(|stored| stored.tab).collect())
+        Ok(results)
     }
 
     fn list_panes(&self, tab_id: &str) -> Result<Vec<Pane>> {
         let tab_id = tab_id.to_string();
         let results = self
             .db
-            .query(move |stored: &StoredPane| stored.pane.tab_id == tab_id)
+            .query(move |pane: &Pane| pane.tab_id == tab_id)
             .map_err(|e| StateError::FeltDbError(format!("Query failed: {}", e)))?;
 
-        Ok(results.into_iter().map(|stored| stored.pane).collect())
+        Ok(results)
     }
 
     fn delete_workspace(&self, workspace_id: &str) -> Result<()> {
@@ -186,45 +156,26 @@ impl WorkspaceStore for FeltDbWorkspaceStore {
         // Get all tabs for this workspace
         let tabs = self.list_tabs(workspace_id)?;
 
-        // Collect all pane keys to delete
-        let mut pane_keys = Vec::new();
+        // Delete all panes for all tabs
         for tab in &tabs {
             let panes = self.list_panes(&tab.id)?;
             for pane in panes {
-                pane_keys.push(format!("pane:{}", pane.id));
+                self.delete_pane(&pane.id)?;
             }
         }
 
-        let tab_keys: Vec<String> = tabs.iter().map(|t| format!("tab:{}", t.id)).collect();
-
-        // Build atomic transaction to delete all related records
-        let mut mutations = Vec::new();
-        mutations.push(AtomicMutation {
-            capability: workspace_key.clone(),
-            key: workspace_key,
-            value: None,
-        });
-
-        for tab_key in tab_keys {
-            mutations.push(AtomicMutation {
-                capability: tab_key.clone(),
-                key: tab_key,
-                value: None,
-            });
+        // Delete all tabs
+        for tab in tabs {
+            let key = format!("tab:{}", tab.id);
+            self.db
+                .delete(&key)
+                .map_err(|e| StateError::FeltDbError(format!("Delete failed: {}", e)))?;
         }
 
-        for pane_key in pane_keys {
-            mutations.push(AtomicMutation {
-                capability: pane_key.clone(),
-                key: pane_key,
-                value: None,
-            });
-        }
-
-        let transaction_id = Uuid::new_v4().to_string();
+        // Delete the workspace
         self.db
-            .apply_atomic_transaction(&transaction_id, None, &[], &mutations, None)
-            .map_err(|e| StateError::FeltDbError(format!("Transaction failed: {}", e)))?;
+            .delete(&workspace_key)
+            .map_err(|e| StateError::FeltDbError(format!("Delete failed: {}", e)))?;
 
         Ok(())
     }
@@ -234,28 +185,16 @@ impl WorkspaceStore for FeltDbWorkspaceStore {
 
         // Get all panes for this tab
         let panes = self.list_panes(tab_id)?;
-        let pane_keys: Vec<String> = panes.iter().map(|p| format!("pane:{}", p.id)).collect();
 
-        // Build atomic transaction to delete tab and all its panes
-        let mut mutations = Vec::new();
-        mutations.push(AtomicMutation {
-            capability: tab_key.clone(),
-            key: tab_key,
-            value: None,
-        });
-
-        for pane_key in pane_keys {
-            mutations.push(AtomicMutation {
-                capability: pane_key.clone(),
-                key: pane_key,
-                value: None,
-            });
+        // Delete all panes
+        for pane in panes {
+            self.delete_pane(&pane.id)?;
         }
 
-        let transaction_id = Uuid::new_v4().to_string();
+        // Delete the tab
         self.db
-            .apply_atomic_transaction(&transaction_id, None, &[], &mutations, None)
-            .map_err(|e| StateError::FeltDbError(format!("Transaction failed: {}", e)))?;
+            .delete(&tab_key)
+            .map_err(|e| StateError::FeltDbError(format!("Delete failed: {}", e)))?;
 
         Ok(())
     }
@@ -270,13 +209,157 @@ impl WorkspaceStore for FeltDbWorkspaceStore {
 
     fn set_selected_workspace(&self, workspace_id: Option<String>) -> Result<()> {
         let key = "session:selected_workspace_id";
-        let metadata = StoredSessionMetadata { workspace_id };
-        let value = serde_json::to_value(&metadata)
-            .map_err(|e| StateError::FeltDbError(format!("Serialization failed: {}", e)))?;
+        let metadata = SessionMetadata { workspace_id };
 
         self.db
-            .insert(key, value)
+            .insert(key, metadata)
             .map_err(|e| StateError::FeltDbError(format!("Insert failed: {}", e)))?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn create_test_store() -> Result<(FeltDbWorkspaceStore, TempDir)> {
+        let temp_dir = TempDir::new()
+            .map_err(|e| StateError::FeltDbError(format!("Failed to create temp dir: {}", e)))?;
+        let db_path = temp_dir.path().join("test.db");
+
+        let db = feltdb::FeltDb::open(&db_path)
+            .map_err(|e| StateError::FeltDbError(format!("Failed to open FeltDB: {}", e)))?;
+
+        Ok((FeltDbWorkspaceStore { db }, temp_dir))
+    }
+
+    #[test]
+    fn test_create_and_load_workspace() -> Result<()> {
+        let (store, _temp) = create_test_store()?;
+
+        let ws = Workspace {
+            id: "ws1".to_string(),
+            kind: WorkspaceKind::Folder,
+            path: "/home/user/project".to_string(),
+            label: Some("My Project".to_string()),
+            position: 0,
+        };
+
+        store.save_workspace(ws.clone())?;
+        let loaded = store.load_workspace("ws1")?;
+
+        assert_eq!(loaded, Some(ws));
+        Ok(())
+    }
+
+    #[test]
+    fn test_list_workspaces() -> Result<()> {
+        let (store, _temp) = create_test_store()?;
+
+        let ws1 = Workspace::new(WorkspaceKind::Folder, "/project1".to_string());
+        let ws2 = Workspace::new(WorkspaceKind::Folder, "/project2".to_string());
+
+        store.save_workspace(ws1.clone())?;
+        store.save_workspace(ws2.clone())?;
+
+        let workspaces = store.list_workspaces()?;
+        assert_eq!(workspaces.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn test_workspace_tabs_and_panes() -> Result<()> {
+        let (store, _temp) = create_test_store()?;
+
+        let ws = Workspace::new(WorkspaceKind::Folder, "/project".to_string());
+        store.save_workspace(ws.clone())?;
+
+        let tab = Tab::new(ws.id.clone(), "Tab 1".to_string());
+        store.save_tab(tab.clone())?;
+
+        let pane = Pane::new(tab.id.clone(), "/project".to_string());
+        store.save_pane(pane.clone())?;
+
+        let loaded_tab = store.load_tab(&tab.id)?;
+        assert_eq!(loaded_tab, Some(tab.clone()));
+
+        let loaded_pane = store.load_pane(&pane.id)?;
+        assert_eq!(loaded_pane, Some(pane));
+
+        let tabs = store.list_tabs(&ws.id)?;
+        assert_eq!(tabs.len(), 1);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_delete_workspace_cascade() -> Result<()> {
+        let (store, _temp) = create_test_store()?;
+
+        let ws = Workspace::new(WorkspaceKind::Folder, "/project".to_string());
+        store.save_workspace(ws.clone())?;
+
+        let tab = Tab::new(ws.id.clone(), "Tab 1".to_string());
+        store.save_tab(tab.clone())?;
+
+        let pane = Pane::new(tab.id.clone(), "/project".to_string());
+        store.save_pane(pane.clone())?;
+
+        store.delete_workspace(&ws.id)?;
+
+        let loaded_ws = store.load_workspace(&ws.id)?;
+        assert_eq!(loaded_ws, None);
+
+        let tabs = store.list_tabs(&ws.id)?;
+        assert_eq!(tabs.len(), 0);
+
+        let loaded_pane = store.load_pane(&pane.id)?;
+        assert_eq!(loaded_pane, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_selected_workspace() -> Result<()> {
+        let (store, _temp) = create_test_store()?;
+
+        let ws = Workspace::new(WorkspaceKind::Folder, "/project".to_string());
+        store.save_workspace(ws.clone())?;
+
+        store.set_selected_workspace(Some(ws.id.clone()))?;
+        let state = store.load_state()?;
+
+        assert_eq!(state.selected_workspace_id, Some(ws.id));
+        Ok(())
+    }
+
+    #[test]
+    fn test_persistence_across_reconnect() -> Result<()> {
+        let temp_dir = TempDir::new()
+            .map_err(|e| StateError::FeltDbError(format!("Failed to create temp dir: {}", e)))?;
+        let db_path = temp_dir.path().join("persist.db");
+
+        // Create and populate store
+        {
+            let db = feltdb::FeltDb::open(&db_path)
+                .map_err(|e| StateError::FeltDbError(format!("Failed to open FeltDB: {}", e)))?;
+            let store = FeltDbWorkspaceStore { db };
+
+            let ws = Workspace::new(WorkspaceKind::Folder, "/project".to_string());
+            store.save_workspace(ws)?;
+        }
+
+        // Reopen and verify
+        {
+            let db = feltdb::FeltDb::open(&db_path)
+                .map_err(|e| StateError::FeltDbError(format!("Failed to open FeltDB: {}", e)))?;
+            let store = FeltDbWorkspaceStore { db };
+
+            let workspaces = store.list_workspaces()?;
+            assert_eq!(workspaces.len(), 1);
+        }
 
         Ok(())
     }
