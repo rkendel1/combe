@@ -2,9 +2,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StateError {
-    #[error("database error: {0}")]
-    Database(#[from] rusqlite::Error),
-
     #[error("io error at {path}: {source}")]
     Io {
         path: PathBuf,
@@ -19,6 +16,9 @@ pub enum StateError {
         source: serde_json::Error,
     },
 
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
+
     #[error("entity not found: {entity_type} {id}")]
     NotFound {
         entity_type: String,
@@ -28,11 +28,11 @@ pub enum StateError {
     #[error("invalid entity: {0}")]
     InvalidEntity(String),
 
-    #[error("database schema mismatch: expected version {expected}, got {actual}")]
-    SchemaMismatch { expected: u32, actual: u32 },
+    #[error("feltdb error: {0}")]
+    FeltDbError(String),
 
-    #[error("transaction error: {0}")]
-    Transaction(String),
+    #[error("migration error: {0}")]
+    MigrationError(String),
 }
 
 pub type Result<T> = std::result::Result<T, StateError>;

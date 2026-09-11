@@ -1,61 +1,31 @@
-use crate::error::Result;
-use crate::*;
-use std::path::PathBuf;
+use crate::{Pane, Tab, Workspace, WorkspaceState, Result};
 
-pub struct WorkspaceStore {
-    path: PathBuf,
-}
+pub trait WorkspaceStore: Send + Sync {
+    fn load_state(&self) -> Result<WorkspaceState>;
 
-impl WorkspaceStore {
-    pub fn open(path: &std::path::Path) -> Result<Self> {
-        std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new(".")))
-            .map_err(|source| crate::error::StateError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
+    fn save_workspace(&self, workspace: Workspace) -> Result<()>;
 
-        Ok(Self {
-            path: path.to_path_buf(),
-        })
-    }
+    fn save_tab(&self, tab: Tab) -> Result<()>;
 
-    pub fn save_workspace(&mut self, _ws: &Workspace) -> Result<()> {
-        todo!("Implement FeltDB-backed workspace persistence")
-    }
+    fn save_pane(&self, pane: Pane) -> Result<()>;
 
-    pub fn load_workspace(&self, _id: &str) -> Result<Option<Workspace>> {
-        todo!("Implement FeltDB-backed workspace loading")
-    }
+    fn load_workspace(&self, id: &str) -> Result<Option<Workspace>>;
 
-    pub fn list_workspaces(&self) -> Result<Vec<Workspace>> {
-        todo!("Implement FeltDB-backed workspace listing")
-    }
+    fn load_tab(&self, id: &str) -> Result<Option<Tab>>;
 
-    pub fn save_tab(&mut self, _tab: &Tab) -> Result<()> {
-        todo!("Implement FeltDB-backed tab persistence")
-    }
+    fn load_pane(&self, id: &str) -> Result<Option<Pane>>;
 
-    pub fn load_tab(&self, _id: &str) -> Result<Option<Tab>> {
-        todo!("Implement FeltDB-backed tab loading")
-    }
+    fn list_workspaces(&self) -> Result<Vec<Workspace>>;
 
-    pub fn list_tabs(&self, _workspace_id: &str) -> Result<Vec<Tab>> {
-        todo!("Implement FeltDB-backed tab listing")
-    }
+    fn list_tabs(&self, workspace_id: &str) -> Result<Vec<Tab>>;
 
-    pub fn save_pane(&mut self, _pane: &Pane) -> Result<()> {
-        todo!("Implement FeltDB-backed pane persistence")
-    }
+    fn list_panes(&self, tab_id: &str) -> Result<Vec<Pane>>;
 
-    pub fn load_pane(&self, _id: &str) -> Result<Option<Pane>> {
-        todo!("Implement FeltDB-backed pane loading")
-    }
+    fn delete_workspace(&self, workspace_id: &str) -> Result<()>;
 
-    pub fn list_panes(&self, _tab_id: &str) -> Result<Vec<Pane>> {
-        todo!("Implement FeltDB-backed pane listing")
-    }
+    fn delete_tab(&self, tab_id: &str) -> Result<()>;
 
-    pub fn state_path() -> Option<PathBuf> {
-        Some(dirs::data_dir()?.join("combe").join("feltdb"))
-    }
+    fn delete_pane(&self, pane_id: &str) -> Result<()>;
+
+    fn set_selected_workspace(&self, workspace_id: Option<String>) -> Result<()>;
 }
