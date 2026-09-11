@@ -5,6 +5,7 @@ use std::process::ExitCode;
 use combe_catalog::{
     Catalog, State, add_repo, catalog, cleanup, load_state, remove_repo, save_state, state_path,
 };
+use combe_state::{FileWorkspaceStore, WorkspaceStore};
 
 const USAGE: &str = "\
 combe — a worktree-aware terminal
@@ -211,7 +212,7 @@ fn open_workspace(paths: &[String]) -> ExitCode {
 }
 
 fn doctor() -> ExitCode {
-    println!("Combe diagnostics:");
+    println!("Combe diagnostics:\n");
 
     match std::env::consts::ARCH {
         "aarch64" => println!("  Architecture: Apple Silicon (arm64)"),
@@ -243,16 +244,16 @@ fn doctor() -> ExitCode {
     if let Some(state_path) = state_path() {
         match std::fs::metadata(&state_path) {
             Ok(meta) => {
-                println!("  State file: {} ({} bytes)", state_path.display(), meta.len());
+                println!("  Catalog state: {} ({} bytes)", state_path.display(), meta.len());
             }
-            Err(_) => println!("  State file: {} (missing, will be created)", state_path.display()),
+            Err(_) => println!("  Catalog state: {} (will be created)", state_path.display()),
         }
     } else {
-        println!("  State file: cannot determine location");
+        println!("  Catalog state: cannot determine location");
     }
 
     let Some(state) = read_state() else {
-        eprintln!("combe: failed to read state");
+        eprintln!("combe: failed to read catalog state");
         return ExitCode::FAILURE;
     };
     println!("  Registered repos: {}", state.repos.len());
@@ -262,6 +263,29 @@ fn doctor() -> ExitCode {
         } else {
             println!("    ✗ {} (missing)", repo.path.display());
         }
+    }
+
+    println!("\n  Workspace state:");
+    match FileWorkspaceStore::for_combe() {
+        Ok(store) => {
+            match store.load_state() {
+                Ok(ws_state) => {
+                    println!("    Workspaces: {}", ws_state.workspaces.len());
+                    for ws in &ws_state.workspaces {
+                        if std::path::Path::new(&ws.path).is_dir() {
+                            println!("      ✓ {} ({})", ws.id, ws.path);
+                        } else {
+                            println!("      ✗ {} (missing: {})", ws.id, ws.path);
+                        }
+                    }
+                    if let Some(selected) = &ws_state.selected_workspace_id {
+                        println!("    Selected: {}", selected);
+                    }
+                }
+                Err(err) => println!("    Error reading state: {}", err),
+            }
+        }
+        Err(err) => println!("    Error: {}", err),
     }
 
     ExitCode::SUCCESS

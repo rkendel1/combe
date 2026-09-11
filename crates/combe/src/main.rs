@@ -6,6 +6,7 @@ mod habits;
 mod overview;
 mod quota;
 mod quota_panel;
+mod recovery;
 mod session;
 mod sidebar;
 mod split;
