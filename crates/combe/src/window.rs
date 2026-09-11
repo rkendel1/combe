@@ -15,13 +15,12 @@ use objc2_app_kit::{
     NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSApplicationDelegate,
     NSApplicationTerminateReply, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath,
     NSButton, NSColor, NSComboBox, NSControlStateValueOn, NSEvent, NSEventModifierFlags,
-    NSEventType, NSFont, NSImage, NSImageView, NSMenu, NSMenuItem, NSFontAttributeName,
-    NSForegroundColorAttributeName,
-    NSMenuWillSendActionNotification, NSOpenPanel, NSPopUpButton, NSResponder, NSScrollView,
-    NSSecureTextField, NSShadow, NSSplitView, NSSplitViewDelegate, NSSplitViewDividerStyle, NSText,
-    NSTextField, NSUserInterfaceItemIdentification, NSView, NSViewLayerContentsRedrawPolicy,
-    NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
-    NSWorkspace,
+    NSEventType, NSFont, NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSImageView,
+    NSMenu, NSMenuItem, NSMenuWillSendActionNotification, NSOpenPanel, NSPopUpButton, NSResponder,
+    NSScrollView, NSSecureTextField, NSShadow, NSSplitView, NSSplitViewDelegate,
+    NSSplitViewDividerStyle, NSText, NSTextField, NSUserInterfaceItemIdentification, NSView,
+    NSViewLayerContentsRedrawPolicy, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask,
+    NSWindowTitleVisibility, NSWorkspace,
 };
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::{
@@ -1622,7 +1621,9 @@ fn open_context_file(root: &Path, files: &[String]) {
     if alert.runModal() != NSAlertFirstButtonReturn {
         return;
     }
-    let Ok(index) = usize::try_from(picker.indexOfSelectedItem()) else { return };
+    let Ok(index) = usize::try_from(picker.indexOfSelectedItem()) else {
+        return;
+    };
     let Some(file) = files.get(index) else { return };
     dismiss_work_overview();
     open_worktree_inspector(root);
@@ -2360,8 +2361,8 @@ fn render_worktree_inspector() {
                     content,
                     numbered,
                     byte_size,
+                    modified_at,
                     git,
-                    ..
                 } => {
                     inspector_label(
                         mtm,
@@ -2376,7 +2377,16 @@ fn render_worktree_inspector() {
                     inspector_label(
                         mtm,
                         &document,
-                        &format!("{byte_size} bytes · Git {}", git.marker().trim()),
+                        &format!(
+                            "{byte_size} bytes · Git {git:?}{}",
+                            modified_at
+                                .map(|value| format!(
+                                    " · Modified {}",
+                                    chrono::DateTime::<chrono::Local>::from(value)
+                                        .format("%Y-%m-%d %H:%M")
+                                ))
+                                .unwrap_or_default()
+                        ),
                         16.0,
                         y,
                         width - 32.0,
@@ -2533,26 +2543,57 @@ fn file_context_status(root: &Path, path: &Path) -> String {
 fn highlighted_source(value: &str, path: &Path) -> Retained<NSMutableAttributedString> {
     let attributed = NSMutableAttributedString::from_nsstring(&NSString::from_str(value));
     let length = value.encode_utf16().count();
-    let font = NSFont::userFixedPitchFontOfSize(12.0)
-        .unwrap_or_else(|| NSFont::systemFontOfSize(12.0));
+    let font =
+        NSFont::userFixedPitchFontOfSize(12.0).unwrap_or_else(|| NSFont::systemFontOfSize(12.0));
     unsafe {
-        attributed.addAttribute_value_range(
-            NSFontAttributeName,
-            &font,
-            NSRange::new(0, length),
-        );
+        attributed.addAttribute_value_range(NSFontAttributeName, &font, NSRange::new(0, length));
         attributed.addAttribute_value_range(
             NSForegroundColorAttributeName,
             &NSColor::labelColor(),
             NSRange::new(0, length),
         );
     }
-    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
     let keywords: &[&str] = match extension {
-        "rs" => &["fn", "let", "mut", "pub", "struct", "enum", "impl", "use", "match", "if", "else", "return", "self", "Self"],
-        "ts" | "tsx" | "js" | "jsx" => &["function", "const", "let", "class", "interface", "type", "export", "import", "from", "return", "async", "await", "if", "else"],
-        "py" => &["def", "class", "import", "from", "return", "async", "await", "if", "else", "for", "in"],
-        "go" => &["func", "type", "struct", "interface", "package", "import", "return", "go", "defer", "if", "else"],
+        "rs" => &[
+            "fn", "let", "mut", "pub", "struct", "enum", "impl", "use", "match", "if", "else",
+            "return", "self", "Self",
+        ],
+        "ts" | "tsx" | "js" | "jsx" => &[
+            "function",
+            "const",
+            "let",
+            "class",
+            "interface",
+            "type",
+            "export",
+            "import",
+            "from",
+            "return",
+            "async",
+            "await",
+            "if",
+            "else",
+        ],
+        "py" => &[
+            "def", "class", "import", "from", "return", "async", "await", "if", "else", "for", "in",
+        ],
+        "go" => &[
+            "func",
+            "type",
+            "struct",
+            "interface",
+            "package",
+            "import",
+            "return",
+            "go",
+            "defer",
+            "if",
+            "else",
+        ],
         _ => &[],
     };
     let color = NSColor::systemBlueColor();
