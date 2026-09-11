@@ -41,5 +41,7 @@ Use these words in code, commits, and docs. If a new domain word sticks, add it 
 | Execution | One durable, provider-neutral materialization of an authorized Assignment, from start through one terminal outcome. |
 | Execution provider | A replaceable adapter that performs an Assignment and reports observations to canonical Work transitions. |
 | Execution result | The bounded canonical outcome of an Execution. Provider transcripts remain external. |
+| Work protocol | The versioned provider-neutral request, context, and contribution vocabulary for a Work. FeltDB remains authoritative. |
+| Execution review | A durable participant evaluation anchored to one Execution and its Assignment. |
 
 Out of vocabulary: agent session, workbench, desk, execution host, orcad, theme, setting, preference pane.

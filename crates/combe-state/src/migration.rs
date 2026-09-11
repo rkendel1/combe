@@ -13,10 +13,7 @@ pub struct LegacyState {
     pub repos: Vec<LegacyRepo>,
 }
 
-pub fn migrate_from_json(
-    json_path: &Path,
-    store: &dyn WorkspaceStore,
-) -> Result<MigrationResult> {
+pub fn migrate_from_json(json_path: &Path, store: &dyn WorkspaceStore) -> Result<MigrationResult> {
     if !json_path.exists() {
         return Ok(MigrationResult::NoLegacyState);
     }
@@ -40,11 +37,7 @@ pub fn migrate_from_json(
         let workspace = Workspace {
             id: uuid::Uuid::new_v4().to_string(),
             kind: WorkspaceKind::Folder,
-            path: repo
-                .path
-                .to_str()
-                .unwrap_or_default()
-                .to_string(),
+            path: repo.path.to_str().unwrap_or_default().to_string(),
             label: None,
             position: migrated,
         };

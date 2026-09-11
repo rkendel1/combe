@@ -1,5 +1,5 @@
-use crate::{Pane, Result, StateError, Tab, Workspace, WorkspaceState, WorkspaceKind};
 use crate::store::WorkspaceStore;
+use crate::{Pane, Result, StateError, Tab, Workspace, WorkspaceKind, WorkspaceState};
 use std::path::PathBuf;
 
 /// FeltDbWorkspaceStore provides durable workspace state using the FeltDB Rust crate.
@@ -31,8 +31,9 @@ impl FeltDbWorkspaceStore {
 
     /// Get the default database path for Combe.
     fn database_path() -> Result<PathBuf> {
-        let app_support = dirs::data_dir()
-            .ok_or_else(|| StateError::FeltDbError("Cannot determine data directory".to_string()))?;
+        let app_support = dirs::data_dir().ok_or_else(|| {
+            StateError::FeltDbError("Cannot determine data directory".to_string())
+        })?;
         Ok(app_support.join("combe").join("workspace-data"))
     }
 

@@ -50,3 +50,5 @@ combe work assign WORK_ID --to Codex --proposal PROPOSAL_ID --instruction "Imple
 ```
 
 Exported `COMBE_WORK_CONTEXT` version 2 contains the bounded coordination projection for the next participant.
+
+The version 2 package is also the provider-neutral Work protocol. Each package carries the FeltDB authority revision on which it is based. Returned contributions must identify that revision; stale submissions are rejected rather than merged. Proposal reviews use `ProposalReview`, while reviews of completed or failed work use an `ExecutionReview` anchored to its Execution and Assignment.

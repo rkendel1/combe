@@ -20,13 +20,13 @@ pub enum StateError {
     Json(#[from] serde_json::Error),
 
     #[error("entity not found: {entity_type} {id}")]
-    NotFound {
-        entity_type: String,
-        id: String,
-    },
+    NotFound { entity_type: String, id: String },
 
     #[error("invalid entity: {0}")]
     InvalidEntity(String),
+
+    #[error("stale Work context: expected revision {expected}, current revision {current}")]
+    StaleContext { expected: u64, current: u64 },
 
     #[error("feltdb error: {0}")]
     FeltDbError(String),

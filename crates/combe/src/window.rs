@@ -36,8 +36,8 @@ use crate::surface::SurfaceView;
 use crate::tabs::Tabs;
 use crate::work_overview;
 use combe_state::{
-    ConversationProvider, FeltDbWorkStore, ParticipantKind, ProposalStatus, WorkContext, WorkId,
-    WorkStore,
+    ConversationProvider, ExecutionStatus, FeltDbWorkStore, ParticipantKind, ProposalStatus,
+    WorkContext, WorkId, WorkStore,
 };
 
 const ROW_HEIGHT: f64 = 36.0;
@@ -1007,7 +1007,7 @@ fn open_work_overview(id: &WorkId) {
         let assign_id = id.clone();
         let actions = work_overview::Actions {
             new_proposal: Box::new(move || new_work_proposal(&new_proposal_id)),
-            review: Box::new(move || proposal_action(&review_id, "request-changes")),
+            review: Box::new(move || review_work(&review_id)),
             approve: Box::new(move || proposal_action(&approve_id, "approve")),
             reject: Box::new(move || proposal_action(&reject_id, "reject")),
             assign: Box::new(move || assign_proposal(&assign_id)),
@@ -1175,6 +1175,64 @@ fn proposal_action(id: &WorkId, action: &str) {
         shell_word(&executable.to_string_lossy()),
         shell_word(action),
         shell_word(&proposal_id)
+    ));
+}
+
+fn review_work(id: &WorkId) {
+    let Ok(store) = FeltDbWorkStore::for_combe() else {
+        return;
+    };
+    if store.proposals(id).is_ok_and(|proposals| {
+        proposals
+            .iter()
+            .any(|proposal| proposal.status == ProposalStatus::Proposed)
+    }) {
+        proposal_action(id, "request-changes");
+        return;
+    }
+    let Ok(context) = store.context(id) else {
+        return;
+    };
+    let executions = context
+        .executions
+        .iter()
+        .filter(|execution| execution.status != ExecutionStatus::Started)
+        .filter(|execution| {
+            !context
+                .execution_reviews
+                .iter()
+                .any(|review| review.execution_id == execution.id)
+        })
+        .collect::<Vec<_>>();
+    if executions.is_empty() {
+        return;
+    }
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Review Execution"));
+    alert.setInformativeText(&NSString::from_str("Choose completed work to review."));
+    for execution in &executions {
+        alert.addButtonWithTitle(&NSString::from_str(&format!(
+            "{} · {:?}",
+            execution.provider, execution.status
+        )));
+    }
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let Some(execution) = usize::try_from(alert.runModal() - NSAlertFirstButtonReturn)
+        .ok()
+        .and_then(|index| executions.get(index))
+    else {
+        return;
+    };
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    run_in_focused_terminal(&format!(
+        "pbpaste | {} work review {} --participant Human --execution {} --revision {}",
+        shell_word(&executable.to_string_lossy()),
+        shell_word(&id.0),
+        shell_word(&execution.id.0),
+        context.revision
     ));
 }
 

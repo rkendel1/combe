@@ -24,6 +24,8 @@ Later contributions to an already linked conversation may use the same import co
 
 ## Canonical export
 
-Text exports begin with `COMBE_WORK_CONTEXT`, declare `version: 1`, contain the bounded Work projection and repository identity, and end with `END_COMBE_WORK_CONTEXT`. JSON exports serialize the same `ContextPackage`. Neither representation exposes unrelated FeltDB records or repository contents.
+Text exports begin with `COMBE_WORK_CONTEXT`, declare `version: 2`, include the authority revision and requested participant action, contain the bounded Work projection and repository identity, and end with `END_COMBE_WORK_CONTEXT`. JSON exports serialize the same `ContextPackage`. Neither representation exposes unrelated FeltDB records or repository contents.
 
 Provider integration belongs behind adapters. The Work domain has no dependency on OpenAI, Anthropic, Codex, ChatGPT internals, or any provider conversation protocol.
+
+External participants exchange bounded `WorkRequest`, `WorkContext`, and `WorkContribution` protocol values. Their contribution retains the external Conversation reference and the FeltDB revision of the context they consumed. Provider integrations translate these values; they never mirror conversations or own a parallel Work model.

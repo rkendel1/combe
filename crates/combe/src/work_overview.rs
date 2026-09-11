@@ -133,6 +133,53 @@ fn content(context: &WorkContext) -> String {
     if let Some(objective) = &context.work.objective {
         text.push_str(&format!("\n{objective}\n"));
     }
+    text.push_str("\nCOORDINATION\n");
+    if let Some(execution) = context.executions.last() {
+        let assignment = context
+            .assignments
+            .iter()
+            .find(|assignment| assignment.id == execution.assignment_id);
+        let proposal = assignment
+            .and_then(|assignment| assignment.proposal_id.as_ref())
+            .and_then(|proposal_id| {
+                context
+                    .proposals
+                    .iter()
+                    .find(|proposal| proposal.id == *proposal_id)
+            });
+        let decision = proposal.and_then(|proposal| {
+            context
+                .decisions
+                .iter()
+                .find(|decision| decision.proposal_id.as_ref() == Some(&proposal.id))
+        });
+        let review = context
+            .execution_reviews
+            .iter()
+            .rev()
+            .find(|review| review.execution_id == execution.id);
+        text.push_str(&format!(
+            "Proposal\n{}\n{}\nExecution\n{} · {:?}\nReview\n{}\nNext\n{}\n",
+            proposal
+                .map(|proposal| proposal.title.as_str())
+                .unwrap_or("Unlinked"),
+            decision
+                .map(|decision| format!("Approved by {}", decision.decided_by))
+                .unwrap_or_else(|| "No approval linked".into()),
+            execution.provider,
+            execution.status,
+            review
+                .map(|review| review.content.as_str())
+                .unwrap_or("Awaiting review"),
+            if review.is_some() {
+                "Inspect review"
+            } else {
+                "Review execution"
+            }
+        ));
+    } else {
+        text.push_str("No execution yet\nNext\nAssign approved work\n");
+    }
     text.push_str("\nPROPOSALS\n");
     for proposal in &context.state.active_proposals {
         text.push_str(&format!(

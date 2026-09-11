@@ -9,15 +9,17 @@ use uuid::Uuid;
 
 use crate::work_store::{
     CONTEXT_ARTIFACT_LIMIT, CONTEXT_ASSIGNMENT_LIMIT, CONTEXT_CONVERSATION_LIMIT,
-    CONTEXT_DECISION_LIMIT, CONTEXT_EXECUTION_LIMIT, CONTEXT_PROPOSAL_LIMIT, CONTEXT_RESULT_LIMIT,
-    CONTEXT_REVIEW_LIMIT, CONTEXT_TEXT_LIMIT, CONTEXT_TURN_LIMIT, EXECUTION_STALE_AFTER_MINUTES,
+    CONTEXT_DECISION_LIMIT, CONTEXT_EXECUTION_LIMIT, CONTEXT_EXECUTION_REVIEW_LIMIT,
+    CONTEXT_PROPOSAL_LIMIT, CONTEXT_RESULT_LIMIT, CONTEXT_REVIEW_LIMIT, CONTEXT_TEXT_LIMIT,
+    CONTEXT_TURN_LIMIT, EXECUTION_STALE_AFTER_MINUTES,
 };
 use crate::{
-    ArtifactId, AssignmentId, AssignmentStatus, ConversationId, ExecutionId, ExecutionStatus,
-    Participant, ParticipantId, ParticipantResult, ProposalId, ProposalReview, ProposalStatus,
-    Result, ReviewId, ReviewOutcome, StateError, TurnId, TurnOrigin, Work, WorkArtifact,
-    WorkAssignment, WorkContext, WorkConversation, WorkDecision, WorkExecution, WorkId,
-    WorkProposal, WorkState, WorkStatus, WorkStore, WorkTurn,
+    ArtifactId, AssignmentId, AssignmentStatus, ContributionAcceptance, ContributionKind,
+    ConversationId, ExecutionId, ExecutionReview, ExecutionReviewId, ExecutionStatus, Participant,
+    ParticipantId, ParticipantResult, ProposalId, ProposalReview, ProposalStatus, Result, ReviewId,
+    ReviewOutcome, StateError, TurnId, TurnKind, TurnOrigin, WORK_CONTEXT_VERSION, Work,
+    WorkArtifact, WorkAssignment, WorkContext, WorkContribution, WorkConversation, WorkDecision,
+    WorkExecution, WorkId, WorkProposal, WorkState, WorkStatus, WorkStore, WorkTurn,
 };
 
 pub struct FeltDbWorkStore {
@@ -121,18 +123,42 @@ impl FeltDbWorkStore {
     fn atomic(
         &self,
         mutations: Vec<AtomicMutation>,
-        absent: Vec<AtomicPrecondition>,
+        preconditions: Vec<AtomicPrecondition>,
     ) -> Result<()> {
-        self.db
-            .apply_atomic_transaction(
-                &format!("combe-{}", Uuid::new_v4()),
-                None,
-                &absent,
-                &mutations,
-                Some(json!({ "application": "combe" })),
-            )
-            .map_err(|error| StateError::FeltDbError(error.to_string()))?;
-        Ok(())
+        self.atomic_at(None, mutations, preconditions)
+    }
+
+    fn atomic_at(
+        &self,
+        expected_revision: Option<u64>,
+        mutations: Vec<AtomicMutation>,
+        preconditions: Vec<AtomicPrecondition>,
+    ) -> Result<()> {
+        if let Some(expected) = expected_revision {
+            let current = self.current_revision()?;
+            if current != expected {
+                return Err(StateError::StaleContext { expected, current });
+            }
+        }
+        let outcome = self.db.apply_atomic_transaction(
+            &format!("combe-{}", Uuid::new_v4()),
+            expected_revision,
+            &preconditions,
+            &mutations,
+            Some(json!({ "application": "combe" })),
+        );
+        match outcome {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                if let Some(expected) = expected_revision {
+                    let current = self.current_revision()?;
+                    if current != expected {
+                        return Err(StateError::StaleContext { expected, current });
+                    }
+                }
+                Err(StateError::FeltDbError(error.to_string()))
+            }
+        }
     }
 
     fn require_work(&self, id: &WorkId) -> Result<Work> {
@@ -518,7 +544,18 @@ impl WorkStore for FeltDbWorkStore {
             .filter_map(|id| self.load_result(id).transpose())
             .collect::<Result<Vec<_>>>()?;
         results.reverse();
+        let execution_reviews = self
+            .execution_reviews(work_id)?
+            .into_iter()
+            .rev()
+            .take(CONTEXT_EXECUTION_REVIEW_LIMIT)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         Ok(WorkContext {
+            context_version: WORK_CONTEXT_VERSION,
+            revision: self.current_revision()?,
             work,
             participants,
             recent_turns,
@@ -532,6 +569,7 @@ impl WorkStore for FeltDbWorkStore {
             executions,
             assignments,
             results,
+            execution_reviews,
         })
     }
 
@@ -939,6 +977,284 @@ impl WorkStore for FeltDbWorkStore {
             .scan::<WorkExecution>("execution")?
             .into_iter()
             .find(|execution| execution.assignment_id == *id))
+    }
+
+    fn execution_reviews(&self, work_id: &WorkId) -> Result<Vec<ExecutionReview>> {
+        let mut values: Vec<ExecutionReview> = self.scan("execution-review")?;
+        values.retain(|value| value.work_id == *work_id);
+        values.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.0.cmp(&right.id.0))
+        });
+        Ok(values)
+    }
+
+    fn load_execution_review(&self, id: &ExecutionReviewId) -> Result<Option<ExecutionReview>> {
+        self.get("execution-review", &id.0)
+    }
+
+    fn current_revision(&self) -> Result<u64> {
+        self.db
+            .current_revision()
+            .map_err(|error| StateError::FeltDbError(error.to_string()))
+    }
+
+    fn accept_contribution(
+        &self,
+        contribution: WorkContribution,
+    ) -> Result<ContributionAcceptance> {
+        if contribution.context_version != WORK_CONTEXT_VERSION {
+            return Err(StateError::InvalidEntity(format!(
+                "unsupported Work context version {}",
+                contribution.context_version
+            )));
+        }
+        self.require_work(&contribution.work_id)?;
+        let participant = self
+            .load_participant(&contribution.participant_id)?
+            .filter(|participant| participant.work_id == contribution.work_id)
+            .ok_or_else(|| {
+                StateError::InvalidEntity("participant does not belong to Work".into())
+            })?;
+        self.validate_origin(
+            &contribution.work_id,
+            &contribution.participant_id,
+            &contribution.source,
+        )?;
+        validate_contribution(&contribution.content)?;
+        if let Some(proposal_id) = &contribution.proposal_id
+            && self
+                .load_proposal(proposal_id)?
+                .is_none_or(|proposal| proposal.work_id != contribution.work_id)
+        {
+            return Err(StateError::InvalidEntity(
+                "proposal reference does not belong to Work".into(),
+            ));
+        }
+        if let Some(assignment_id) = &contribution.assignment_id
+            && self
+                .load_assignment(assignment_id)?
+                .is_none_or(|assignment| assignment.work_id != contribution.work_id)
+        {
+            return Err(StateError::InvalidEntity(
+                "assignment reference does not belong to Work".into(),
+            ));
+        }
+        if let Some(execution_id) = &contribution.execution_id {
+            let execution = self.load_execution(execution_id)?.ok_or_else(|| {
+                StateError::InvalidEntity("execution reference does not belong to Work".into())
+            })?;
+            if execution.work_id != contribution.work_id
+                || contribution
+                    .assignment_id
+                    .as_ref()
+                    .is_some_and(|id| *id != execution.assignment_id)
+            {
+                return Err(StateError::InvalidEntity(
+                    "execution reference does not match Work and Assignment".into(),
+                ));
+            }
+        }
+        let expected = Some(contribution.based_on_revision);
+        match contribution.kind {
+            ContributionKind::Message => {
+                let turn = WorkTurn {
+                    id: TurnId::new(),
+                    work_id: contribution.work_id,
+                    participant_id: contribution.participant_id,
+                    kind: TurnKind::Message,
+                    content: contribution.content,
+                    created_at: contribution.created_at,
+                    assignment_id: contribution.assignment_id,
+                    execution_id: contribution.execution_id.map(|id| id.0),
+                    origin: contribution.source,
+                };
+                let id = turn.id.clone();
+                self.atomic_at(
+                    expected,
+                    vec![Self::mutation("turn", &id.0, &turn)?],
+                    vec![Self::absent("turn", &id.0)],
+                )?;
+                Ok(ContributionAcceptance::Turn(id))
+            }
+            ContributionKind::Proposal => {
+                if !participant.capabilities.can_propose {
+                    return Err(StateError::InvalidEntity(
+                        "participant cannot propose".into(),
+                    ));
+                }
+                let title = contribution.title.ok_or_else(|| {
+                    StateError::InvalidEntity("proposal contribution needs a title".into())
+                })?;
+                if title.trim().is_empty() {
+                    return Err(StateError::InvalidEntity(
+                        "proposal contribution title cannot be empty".into(),
+                    ));
+                }
+                let proposal = WorkProposal {
+                    id: ProposalId::new(),
+                    work_id: contribution.work_id,
+                    proposed_by: contribution.participant_id,
+                    title,
+                    statement: contribution.content,
+                    rationale: contribution.rationale,
+                    status: ProposalStatus::Proposed,
+                    origin: contribution.source,
+                    created_at: contribution.created_at,
+                    updated_at: contribution.created_at,
+                };
+                self.atomic_at(
+                    expected,
+                    vec![Self::mutation("proposal", &proposal.id.0, &proposal)?],
+                    vec![Self::absent("proposal", &proposal.id.0)],
+                )?;
+                Ok(ContributionAcceptance::Proposal(proposal.id))
+            }
+            ContributionKind::Review => {
+                if !participant.capabilities.can_review {
+                    return Err(StateError::InvalidEntity(
+                        "participant cannot review".into(),
+                    ));
+                }
+                match (contribution.proposal_id, contribution.execution_id) {
+                    (Some(proposal_id), None) => {
+                        let version = self.version("proposal", &proposal_id.0)?;
+                        let mut proposal = self.load_proposal(&proposal_id)?.ok_or_else(|| {
+                            StateError::NotFound {
+                                entity_type: "proposal".into(),
+                                id: proposal_id.0.clone(),
+                            }
+                        })?;
+                        if proposal.work_id != contribution.work_id
+                            || proposal.status != ProposalStatus::Proposed
+                        {
+                            return Err(StateError::InvalidEntity(
+                                "proposal review reference is not reviewable".into(),
+                            ));
+                        }
+                        let outcome = contribution.review_outcome.ok_or_else(|| {
+                            StateError::InvalidEntity("proposal review needs an outcome".into())
+                        })?;
+                        if outcome == ReviewOutcome::Approve && !participant.capabilities.can_decide
+                        {
+                            return Err(StateError::InvalidEntity(
+                                "participant cannot approve a proposal".into(),
+                            ));
+                        }
+                        let review = ProposalReview {
+                            id: ReviewId::new(),
+                            proposal_id: proposal.id.clone(),
+                            reviewed_by: contribution.participant_id,
+                            outcome,
+                            comment: Some(contribution.content),
+                            origin: contribution.source,
+                            created_at: contribution.created_at,
+                        };
+                        proposal.status = match outcome {
+                            ReviewOutcome::Approve => ProposalStatus::Approved,
+                            ReviewOutcome::Reject => ProposalStatus::Rejected,
+                            ReviewOutcome::RequestChanges => ProposalStatus::Proposed,
+                        };
+                        proposal.updated_at = review.created_at;
+                        let decision = (outcome == ReviewOutcome::Approve).then(|| WorkDecision {
+                            id: Default::default(),
+                            work_id: proposal.work_id.clone(),
+                            statement: proposal.statement.clone(),
+                            rationale: proposal.rationale.clone(),
+                            decided_by: review.reviewed_by.clone(),
+                            created_at: review.created_at,
+                            proposal_id: Some(proposal.id.clone()),
+                            review_id: Some(review.id.clone()),
+                        });
+                        let mut mutations = vec![
+                            Self::mutation("proposal", &proposal.id.0, &proposal)?,
+                            Self::mutation("proposal-review", &review.id.0, &review)?,
+                        ];
+                        let mut preconditions = vec![
+                            Self::at_version("proposal", &proposal.id.0, version),
+                            Self::absent("proposal-review", &review.id.0),
+                        ];
+                        if let Some(decision) = decision {
+                            mutations.push(Self::mutation("decision", &decision.id.0, &decision)?);
+                            preconditions.push(Self::absent("decision", &decision.id.0));
+                        }
+                        self.atomic_at(expected, mutations, preconditions)?;
+                        Ok(ContributionAcceptance::ProposalReview(review.id))
+                    }
+                    (None, Some(execution_id)) => {
+                        let execution = self.load_execution(&execution_id)?.ok_or_else(|| {
+                            StateError::NotFound {
+                                entity_type: "execution".into(),
+                                id: execution_id.0.clone(),
+                            }
+                        })?;
+                        let assignment_id = contribution.assignment_id.ok_or_else(|| {
+                            StateError::InvalidEntity(
+                                "execution review needs its assignment".into(),
+                            )
+                        })?;
+                        if execution.work_id != contribution.work_id
+                            || execution.assignment_id != assignment_id
+                            || execution.status == ExecutionStatus::Started
+                        {
+                            return Err(StateError::InvalidEntity(
+                                "execution review references do not match a terminal execution"
+                                    .into(),
+                            ));
+                        }
+                        let review = ExecutionReview {
+                            id: ExecutionReviewId::new(),
+                            work_id: contribution.work_id,
+                            execution_id,
+                            assignment_id,
+                            reviewed_by: contribution.participant_id,
+                            content: contribution.content,
+                            origin: contribution.source,
+                            context_revision: contribution.based_on_revision,
+                            created_at: contribution.created_at,
+                        };
+                        self.atomic_at(
+                            expected,
+                            vec![Self::mutation("execution-review", &review.id.0, &review)?],
+                            vec![Self::absent("execution-review", &review.id.0)],
+                        )?;
+                        Ok(ContributionAcceptance::ExecutionReview(review.id))
+                    }
+                    _ => Err(StateError::InvalidEntity(
+                        "review must reference exactly one proposal or execution".into(),
+                    )),
+                }
+            }
+            ContributionKind::Decision => {
+                if !participant.capabilities.can_decide {
+                    return Err(StateError::InvalidEntity(
+                        "participant cannot decide".into(),
+                    ));
+                }
+                let decision = WorkDecision {
+                    id: Default::default(),
+                    work_id: contribution.work_id,
+                    statement: contribution.content,
+                    rationale: contribution.rationale,
+                    decided_by: contribution.participant_id,
+                    created_at: contribution.created_at,
+                    proposal_id: contribution.proposal_id,
+                    review_id: None,
+                };
+                self.atomic_at(
+                    expected,
+                    vec![Self::mutation("decision", &decision.id.0, &decision)?],
+                    vec![Self::absent("decision", &decision.id.0)],
+                )?;
+                Ok(ContributionAcceptance::Decision(decision.id))
+            }
+            ContributionKind::ExecutionReport | ContributionKind::ArtifactReport => {
+                Err(StateError::InvalidEntity(
+                    "execution and artifact reports use the canonical execution transition".into(),
+                ))
+            }
+        }
     }
 }
 
@@ -1758,5 +2074,224 @@ mod tests {
             (ExecutionStatus::Completed, AssignmentStatus::Completed)
                 | (ExecutionStatus::Cancelled, AssignmentStatus::Cancelled)
         ));
+    }
+
+    fn contribution(
+        store: &FeltDbWorkStore,
+        work: &Work,
+        participant: &Participant,
+        kind: ContributionKind,
+        content: &str,
+    ) -> WorkContribution {
+        WorkContribution::local(
+            work.id.clone(),
+            participant.id.clone(),
+            store.current_revision().unwrap(),
+            kind,
+            content.into(),
+        )
+    }
+
+    #[test]
+    fn protocol_version_stale_context_and_malformed_references_write_nothing() {
+        let (store, _directory) = store();
+        let (work, human, _) = work_with_participants(&store);
+        let mut unsupported =
+            contribution(&store, &work, &human, ContributionKind::Message, "hello");
+        unsupported.context_version = 99;
+        assert!(store.accept_contribution(unsupported).is_err());
+
+        let stale_revision = store.current_revision().unwrap();
+        store
+            .add_turn(WorkTurn {
+                id: TurnId::new(),
+                work_id: work.id.clone(),
+                participant_id: human.id.clone(),
+                kind: TurnKind::Message,
+                content: "newer state".into(),
+                created_at: Utc::now(),
+                assignment_id: None,
+                execution_id: None,
+                origin: TurnOrigin::Local,
+            })
+            .unwrap();
+        let mut stale = contribution(
+            &store,
+            &work,
+            &human,
+            ContributionKind::Proposal,
+            "stale proposal",
+        );
+        stale.based_on_revision = stale_revision;
+        stale.title = Some("Stale".into());
+        assert!(matches!(
+            store.accept_contribution(stale),
+            Err(StateError::StaleContext { .. })
+        ));
+        assert!(store.proposals(&work.id).unwrap().is_empty());
+
+        let mut malformed = contribution(&store, &work, &human, ContributionKind::Review, "review");
+        malformed.execution_id = Some(ExecutionId::new());
+        malformed.assignment_id = Some(AssignmentId::new());
+        assert!(store.accept_contribution(malformed).is_err());
+        assert!(store.execution_reviews(&work.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn external_protocol_proposal_and_execution_review_preserve_the_complete_chain() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("work.db");
+        let (work_id, execution_id, review_id) = {
+            let store = FeltDbWorkStore::open(&path).unwrap();
+            let (work, human, executor) = work_with_participants(&store);
+            let chatgpt =
+                Participant::new(work.id.clone(), ParticipantKind::Agent, "ChatGPT".into());
+            store.add_participant(chatgpt.clone()).unwrap();
+            let reference = ConversationRef {
+                id: "chatgpt-protocol".into(),
+                provider: ConversationProvider::ChatGpt,
+                title: Some("Protocol review".into()),
+            };
+            store
+                .import_contribution(
+                    WorkConversation {
+                        id: ConversationId::new(),
+                        work_id: work.id.clone(),
+                        conversation: reference.clone(),
+                        participant_id: chatgpt.id.clone(),
+                        label: Some("ChatGPT protocol".into()),
+                        created_at: Utc::now(),
+                    },
+                    WorkTurn {
+                        id: TurnId::new(),
+                        work_id: work.id.clone(),
+                        participant_id: chatgpt.id.clone(),
+                        kind: TurnKind::Analysis,
+                        content: "Initial external context".into(),
+                        created_at: Utc::now(),
+                        assignment_id: None,
+                        execution_id: None,
+                        origin: TurnOrigin::ExternalConversation(reference.clone()),
+                    },
+                )
+                .unwrap();
+            let mut proposal = contribution(
+                &store,
+                &work,
+                &chatgpt,
+                ContributionKind::Proposal,
+                "Implement the protocol boundary",
+            );
+            proposal.title = Some("Protocol boundary".into());
+            proposal.source = TurnOrigin::ExternalConversation(reference.clone());
+            let proposal_id = match store.accept_contribution(proposal).unwrap() {
+                ContributionAcceptance::Proposal(id) => id,
+                _ => unreachable!(),
+            };
+            let proposed = store.load_proposal(&proposal_id).unwrap().unwrap();
+            let mut approval = contribution(
+                &store,
+                &work,
+                &human,
+                ContributionKind::Review,
+                "Approved for execution",
+            );
+            approval.proposal_id = Some(proposed.id.clone());
+            approval.review_outcome = Some(ReviewOutcome::Approve);
+            assert!(matches!(
+                store.accept_contribution(approval).unwrap(),
+                ContributionAcceptance::ProposalReview(_)
+            ));
+            let assignment = WorkAssignment {
+                id: AssignmentId::new(),
+                work_id: work.id.clone(),
+                from_participant_id: human.id.clone(),
+                to_participant_id: executor.id.clone(),
+                instruction: "Implement approved protocol".into(),
+                status: AssignmentStatus::Pending,
+                created_at: Utc::now(),
+                proposal_id: Some(proposal_id),
+            };
+            store.add_assignment(assignment.clone()).unwrap();
+            let now = Utc::now();
+            let mut execution = store
+                .start_execution(WorkExecution {
+                    id: ExecutionId::new(),
+                    work_id: work.id.clone(),
+                    assignment_id: assignment.id.clone(),
+                    participant_id: executor.id.clone(),
+                    provider: "codex".into(),
+                    provider_execution_id: Some("codex-run".into()),
+                    status: ExecutionStatus::Started,
+                    started_at: now,
+                    completed_at: None,
+                    heartbeat_at: Some(now),
+                    result_id: None,
+                    failure: None,
+                    created_at: now,
+                    updated_at: now,
+                })
+                .unwrap();
+            let (result, turn) = terminal_records(&work, &executor, &execution, Some(0));
+            execution.status = ExecutionStatus::Completed;
+            execution.completed_at = Some(Utc::now());
+            execution.updated_at = Utc::now();
+            store
+                .finish_execution(execution.clone(), Some(result), Some(turn), Vec::new())
+                .unwrap();
+            let mut execution_review = contribution(
+                &store,
+                &work,
+                &chatgpt,
+                ContributionKind::Review,
+                "The execution satisfies the approved proposal.",
+            );
+            execution_review.source = TurnOrigin::ExternalConversation(reference);
+            execution_review.assignment_id = Some(assignment.id);
+            execution_review.execution_id = Some(execution.id.clone());
+            let review_id = match store.accept_contribution(execution_review).unwrap() {
+                ContributionAcceptance::ExecutionReview(id) => id,
+                _ => unreachable!(),
+            };
+            (work.id, execution.id, review_id)
+        };
+        let store = FeltDbWorkStore::open(path).unwrap();
+        let context = store.context(&work_id).unwrap();
+        assert_eq!(context.execution_reviews[0].id, review_id);
+        assert_eq!(context.execution_reviews[0].execution_id, execution_id);
+        assert!(matches!(
+            context.execution_reviews[0].origin,
+            TurnOrigin::ExternalConversation(_)
+        ));
+        assert_eq!(context.proposals[0].status, ProposalStatus::Approved);
+        assert_eq!(context.executions[0].status, ExecutionStatus::Completed);
+        assert_eq!(context.results.len(), 1);
+    }
+
+    #[test]
+    fn protocol_contributions_are_provider_neutral_and_capability_checked() {
+        for name in ["ChatGPT", "Claude", "Codex", "Human", "Other"] {
+            let (store, _directory) = store();
+            let work = Work::new("workspace".into(), "Neutral".into(), None);
+            let kind = if name == "Human" {
+                ParticipantKind::Human
+            } else {
+                ParticipantKind::Agent
+            };
+            let participant = Participant::new(work.id.clone(), kind, name.into());
+            store
+                .create_work(work.clone(), vec![participant.clone()])
+                .unwrap();
+            let accepted = store
+                .accept_contribution(contribution(
+                    &store,
+                    &work,
+                    &participant,
+                    ContributionKind::Message,
+                    "provider-neutral contribution",
+                ))
+                .unwrap();
+            assert!(matches!(accepted, ContributionAcceptance::Turn(_)));
+        }
     }
 }

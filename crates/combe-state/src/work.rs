@@ -40,6 +40,7 @@ id!(ConversationId);
 id!(ProposalId);
 id!(ReviewId);
 id!(ExecutionId);
+id!(ExecutionReviewId);
 
 pub type WorkspaceId = String;
 
@@ -87,20 +88,62 @@ pub enum ParticipantKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipantCapabilities {
+    pub can_propose: bool,
+    pub can_review: bool,
+    pub can_execute: bool,
+    pub can_decide: bool,
+}
+
+impl Default for ParticipantCapabilities {
+    fn default() -> Self {
+        Self {
+            can_propose: true,
+            can_review: true,
+            can_execute: false,
+            can_decide: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Participant {
     pub id: ParticipantId,
     pub work_id: WorkId,
     pub kind: ParticipantKind,
     pub name: String,
+    #[serde(default)]
+    pub capabilities: ParticipantCapabilities,
 }
 
 impl Participant {
     pub fn new(work_id: WorkId, kind: ParticipantKind, name: String) -> Self {
+        let capabilities = match kind {
+            ParticipantKind::Human => ParticipantCapabilities {
+                can_propose: true,
+                can_review: true,
+                can_execute: false,
+                can_decide: true,
+            },
+            ParticipantKind::Agent => ParticipantCapabilities {
+                can_propose: true,
+                can_review: true,
+                can_execute: true,
+                can_decide: false,
+            },
+            ParticipantKind::System => ParticipantCapabilities {
+                can_propose: false,
+                can_review: false,
+                can_execute: false,
+                can_decide: false,
+            },
+        };
         Self {
             id: ParticipantId::new(),
             work_id,
             kind,
             name,
+            capabilities,
         }
     }
 }
@@ -252,6 +295,20 @@ pub struct WorkExecution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionReview {
+    pub id: ExecutionReviewId,
+    pub work_id: WorkId,
+    pub execution_id: ExecutionId,
+    pub assignment_id: AssignmentId,
+    pub reviewed_by: ParticipantId,
+    pub content: String,
+    #[serde(default)]
+    pub origin: TurnOrigin,
+    pub context_revision: u64,
+    pub created_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AssignmentStatus {
     Pending,
@@ -313,6 +370,10 @@ pub struct WorkArtifact {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkContext {
+    #[serde(default = "protocol_version")]
+    pub context_version: u32,
+    #[serde(default)]
+    pub revision: u64,
     pub work: Work,
     pub participants: Vec<Participant>,
     pub recent_turns: Vec<WorkTurn>,
@@ -332,6 +393,12 @@ pub struct WorkContext {
     pub assignments: Vec<WorkAssignment>,
     #[serde(default)]
     pub results: Vec<ParticipantResult>,
+    #[serde(default)]
+    pub execution_reviews: Vec<ExecutionReview>,
+}
+
+fn protocol_version() -> u32 {
+    2
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

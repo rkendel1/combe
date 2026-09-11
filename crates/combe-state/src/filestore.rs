@@ -1,6 +1,4 @@
-use crate::{
-    Pane, Tab, Workspace, WorkspaceState, WorkspaceStore, Result, StateError,
-};
+use crate::{Pane, Result, StateError, Tab, Workspace, WorkspaceState, WorkspaceStore};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
@@ -39,12 +37,11 @@ impl FileWorkspaceStore {
     fn load_file(&self) -> Result<FileState> {
         match fs::read_to_string(&self.state_path) {
             Ok(body) => {
-                let state: FileState = serde_json::from_str(&body).map_err(|source| {
-                    StateError::Parse {
+                let state: FileState =
+                    serde_json::from_str(&body).map_err(|source| StateError::Parse {
                         path: self.state_path.clone(),
                         source,
-                    }
-                })?;
+                    })?;
                 if state.version != STATE_VERSION {
                     return Err(StateError::MigrationError(format!(
                         "Unsupported state version: {}",
@@ -53,15 +50,13 @@ impl FileWorkspaceStore {
                 }
                 Ok(state)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Ok(FileState {
-                    version: STATE_VERSION,
-                    selected_workspace_id: None,
-                    workspaces: Vec::new(),
-                    tabs: Vec::new(),
-                    panes: Vec::new(),
-                })
-            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(FileState {
+                version: STATE_VERSION,
+                selected_workspace_id: None,
+                workspaces: Vec::new(),
+                tabs: Vec::new(),
+                panes: Vec::new(),
+            }),
             Err(source) => Err(StateError::Io {
                 path: self.state_path.clone(),
                 source,

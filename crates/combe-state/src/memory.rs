@@ -68,13 +68,7 @@ impl WorkspaceStore for InMemoryWorkspaceStore {
     }
 
     fn list_workspaces(&self) -> Result<Vec<Workspace>> {
-        let mut workspaces: Vec<_> = self
-            .workspaces
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect();
+        let mut workspaces: Vec<_> = self.workspaces.lock().unwrap().values().cloned().collect();
         workspaces.sort_by_key(|w| w.position);
         Ok(workspaces)
     }

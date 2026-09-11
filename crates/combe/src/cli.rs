@@ -11,12 +11,13 @@ use combe_catalog::{
     Catalog, State, add_repo, catalog, cleanup, load_state, remove_repo, save_state, state_path,
 };
 use combe_state::{
-    ArtifactId, ArtifactKind, AssignmentId, AssignmentStatus, ConversationId, ConversationProvider,
-    ConversationRef, ExecutionId, ExecutionStatus, FeltDbWorkStore, FeltDbWorkspaceStore,
-    Participant, ParticipantKind, ParticipantResult, ProposalId, ProposalReview, ProposalStatus,
-    ReviewId, ReviewOutcome, TurnId, TurnKind, TurnOrigin, Work, WorkArtifact, WorkAssignment,
-    WorkConversation, WorkDecision, WorkExecution, WorkId, WorkProposal, WorkStore, WorkTurn,
-    WorkspaceStore,
+    ArtifactId, ArtifactKind, AssignmentId, AssignmentStatus, ContributionAcceptance,
+    ContributionKind, ConversationId, ConversationProvider, ConversationRef, ExecutionId,
+    ExecutionStatus, FeltDbWorkStore, FeltDbWorkspaceStore, Participant, ParticipantKind,
+    ParticipantResult, ProposalId, ProposalReview, ProposalStatus, ReviewId, ReviewOutcome, TurnId,
+    TurnKind, TurnOrigin, WORK_CONTEXT_VERSION, Work, WorkAction, WorkArtifact, WorkAssignment,
+    WorkContribution, WorkConversation, WorkDecision, WorkExecution, WorkId, WorkProposal,
+    WorkStore, WorkTurn, WorkspaceStore,
 };
 
 const USAGE: &str = "\
@@ -33,6 +34,8 @@ Usage:
   combe work create <title> [--workspace <id>] [--objective <text>]
   combe work show <id>
   combe work context <id> [--format <text|json>]
+  combe work protocol <id> [--participant <name-or-id>] [--action <action>] [--format <text|json>]
+  combe work review <id> --participant <name-or-id> --execution <id> [--revision <revision>]
   combe work decision <id> <statement> [--rationale <text>]
   combe work proposal create <work-id> --participant <name-or-id> --title <title>
   combe work proposal list <work-id>
@@ -105,6 +108,8 @@ fn work(args: &[String]) -> ExitCode {
         "create" => work_create(&store, &args[1..]),
         "show" => work_show(&store, &args[1..]),
         "context" => work_context(&store, &args[1..]),
+        "protocol" => work_protocol(&store, &args[1..]),
+        "review" => work_review(&store, &args[1..]),
         "decision" => work_decision(&store, &args[1..]),
         "proposal" => work_proposal(&store, &args[1..]),
         "assign" => work_assign(&store, &args[1..]),
@@ -267,6 +272,150 @@ fn work_context(store: &impl WorkStore, args: &[String]) -> ExitCode {
             eprintln!("combe: context format must be text or json");
             ExitCode::from(2)
         }
+        Err(error) => work_error(error),
+    }
+}
+
+fn protocol_action(value: Option<String>) -> Result<WorkAction, combe_state::StateError> {
+    match value.as_deref().unwrap_or("inspect") {
+        "inspect" => Ok(WorkAction::Inspect),
+        "propose" => Ok(WorkAction::Propose),
+        "review" => Ok(WorkAction::Review),
+        "decide" => Ok(WorkAction::Decide),
+        "assign" => Ok(WorkAction::Assign),
+        "execute" => Ok(WorkAction::Execute),
+        "report" => Ok(WorkAction::Report),
+        value => Err(combe_state::StateError::InvalidEntity(format!(
+            "unknown Work action {value}"
+        ))),
+    }
+}
+
+fn work_protocol(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let Some(id) = parse_work_id(args) else {
+        eprintln!("combe: work protocol needs an id");
+        return ExitCode::from(2);
+    };
+    let result = (|| {
+        let context = store.context(&id)?;
+        let assignment = context.active_assignments.first().cloned();
+        let mut package = ContextPackage::from_context(context, assignment)
+            .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))?;
+        let requested_participant = if let Some(value) = option(args, "--participant") {
+            let participant = participant(store, &id, &value)?;
+            package.request.participant_id = participant.id.clone();
+            participant
+        } else {
+            store
+                .load_participant(&package.request.participant_id)?
+                .ok_or_else(|| {
+                    combe_state::StateError::InvalidEntity("missing participant".into())
+                })?
+        };
+        package.request.requested_action = protocol_action(option(args, "--action"))?;
+        package.request.validate(&requested_participant)?;
+        Ok::<_, combe_state::StateError>(package)
+    })();
+    match result {
+        Ok(package)
+            if option(args, "--format").as_deref() == Some("json")
+                || args.iter().any(|arg| arg == "--json") =>
+        {
+            match serde_json::to_string_pretty(&package) {
+                Ok(json) => {
+                    println!("{json}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => work_error(error),
+            }
+        }
+        Ok(package)
+            if option(args, "--format")
+                .as_deref()
+                .is_none_or(|format| format == "text") =>
+        {
+            print!("{}", package.text());
+            ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            eprintln!("combe: protocol format must be text or json");
+            ExitCode::from(2)
+        }
+        Err(error) => work_error(error),
+    }
+}
+
+fn work_review(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let Some(id) = parse_work_id(args) else {
+        eprintln!("combe: work review needs a Work id");
+        return ExitCode::from(2);
+    };
+    let (Some(participant_value), Some(execution_value)) =
+        (option(args, "--participant"), option(args, "--execution"))
+    else {
+        eprintln!("combe: work review needs --participant and --execution");
+        return ExitCode::from(2);
+    };
+    let result = (|| {
+        let reviewer = participant(store, &id, &participant_value)?;
+        let execution_id = ExecutionId(execution_value);
+        let execution = store.load_execution(&execution_id)?.ok_or_else(|| {
+            combe_state::StateError::NotFound {
+                entity_type: "execution".into(),
+                id: execution_id.0.clone(),
+            }
+        })?;
+        let revision = option(args, "--revision")
+            .map(|value| {
+                value.parse::<u64>().map_err(|_| {
+                    combe_state::StateError::InvalidEntity("revision must be an integer".into())
+                })
+            })
+            .transpose()?
+            .unwrap_or(store.current_revision()?);
+        let source = if let Some(conversation_id) = option(args, "--conversation") {
+            store
+                .conversations(&id)?
+                .into_iter()
+                .find(|link| {
+                    link.participant_id == reviewer.id && link.conversation.id == conversation_id
+                })
+                .map(|link| TurnOrigin::ExternalConversation(link.conversation))
+                .ok_or_else(|| {
+                    combe_state::StateError::InvalidEntity(
+                        "conversation is not linked to the reviewing participant".into(),
+                    )
+                })?
+        } else {
+            TurnOrigin::Local
+        };
+        let mut content = String::new();
+        std::io::stdin()
+            .read_to_string(&mut content)
+            .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))?;
+        store.accept_contribution(WorkContribution {
+            work_id: id,
+            participant_id: reviewer.id,
+            context_version: WORK_CONTEXT_VERSION,
+            based_on_revision: revision,
+            source,
+            kind: ContributionKind::Review,
+            content,
+            title: None,
+            rationale: None,
+            review_outcome: None,
+            proposal_id: None,
+            assignment_id: Some(execution.assignment_id),
+            execution_id: Some(execution.id),
+            created_at: Utc::now(),
+        })
+    })();
+    match result {
+        Ok(ContributionAcceptance::ExecutionReview(id)) => {
+            println!("{id}");
+            ExitCode::SUCCESS
+        }
+        Ok(_) => unreachable!(),
         Err(error) => work_error(error),
     }
 }

@@ -64,6 +64,10 @@ An Assignment authorizes work but does not prove that work began. A canonical pr
 
 The Work overview derives Assigned, Active, Stale, Completed, Failed, and Cancelled groups from canonical Assignment and Execution records. Staleness is a timestamp-derived presentation state, not a persisted status or scheduler. Selecting an item exposes its proposal, approval, assignment, execution provider, terminal result, and provenance. Combe retains no UI-only execution cache and does not supervise hidden processes.
 
+`COMBE_WORK_CONTEXT` version 2 is the Work coordination protocol. Its canonical JSON package contains one bounded `WorkContext`, the FeltDB authority revision captured for that projection, an addressed Participant, and a provider-neutral requested action. Text is a rendering of the same package. A returned `WorkContribution` identifies its participant, source, creation time, originating revision, and any related Proposal, Assignment, or Execution. Acceptance validates capabilities and references, then writes through the existing atomic Work transitions. A stale revision is rejected without mutation.
+
+Proposal review remains `ProposalReview`. Review of performed work is an `ExecutionReview` anchored to both its Execution and Assignment. The overview's compact COORDINATION section surfaces the linked Proposal approval, Execution state, latest review, and next review action. Providers translate their native model at the protocol boundary; they do not own Work state or create provider-specific review records.
+
 ## Non-goals
 
 - Proprietary agents, provider chat overlays, automatic agent dispatch, provider authentication, or process supervision

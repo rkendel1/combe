@@ -1,8 +1,9 @@
 use crate::{
-    ArtifactId, AssignmentId, ConversationId, Participant, ParticipantId, ParticipantResult,
-    ProposalId, ProposalReview, ProposalStatus, Result, ReviewId, TurnId, Work, WorkArtifact,
-    WorkAssignment, WorkContext, WorkConversation, WorkDecision, WorkExecution, WorkId,
-    WorkProposal, WorkStatus, WorkTurn,
+    ArtifactId, AssignmentId, ContributionAcceptance, ConversationId, ExecutionReview,
+    ExecutionReviewId, Participant, ParticipantId, ParticipantResult, ProposalId, ProposalReview,
+    ProposalStatus, Result, ReviewId, TurnId, Work, WorkArtifact, WorkAssignment, WorkContext,
+    WorkContribution, WorkConversation, WorkDecision, WorkExecution, WorkId, WorkProposal,
+    WorkStatus, WorkTurn,
 };
 
 pub const CONTEXT_TURN_LIMIT: usize = 50;
@@ -15,6 +16,7 @@ pub const CONTEXT_REVIEW_LIMIT: usize = 100;
 pub const CONTEXT_EXECUTION_LIMIT: usize = 100;
 pub const CONTEXT_ASSIGNMENT_LIMIT: usize = 100;
 pub const CONTEXT_RESULT_LIMIT: usize = 100;
+pub const CONTEXT_EXECUTION_REVIEW_LIMIT: usize = 100;
 pub const EXECUTION_STALE_AFTER_MINUTES: i64 = 15;
 
 pub trait WorkStore: Send + Sync {
@@ -83,4 +85,9 @@ pub trait WorkStore: Send + Sync {
     fn executions(&self, work_id: &WorkId) -> Result<Vec<WorkExecution>>;
     fn load_execution(&self, id: &crate::ExecutionId) -> Result<Option<WorkExecution>>;
     fn execution_for_assignment(&self, id: &AssignmentId) -> Result<Option<WorkExecution>>;
+    fn execution_reviews(&self, work_id: &WorkId) -> Result<Vec<ExecutionReview>>;
+    fn load_execution_review(&self, id: &ExecutionReviewId) -> Result<Option<ExecutionReview>>;
+    fn current_revision(&self) -> Result<u64>;
+    fn accept_contribution(&self, contribution: WorkContribution)
+    -> Result<ContributionAcceptance>;
 }

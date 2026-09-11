@@ -2,7 +2,10 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use combe_state::{FeltDbWorkspaceStore, Participant, WorkAssignment, WorkContext, WorkspaceStore};
+use combe_state::{
+    FeltDbWorkspaceStore, Participant, WORK_CONTEXT_VERSION, WorkAction, WorkAssignment,
+    WorkContext, WorkRequest, WorkspaceStore,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
@@ -60,6 +63,7 @@ pub struct ContextPackage {
     pub assignment: Option<WorkAssignment>,
     pub repository: RepositoryContext,
     pub constraints: Vec<String>,
+    pub request: WorkRequest,
 }
 
 impl ContextPackage {
@@ -83,6 +87,27 @@ impl ContextPackage {
         }
         let repository_root = git(path, &["rev-parse", "--show-toplevel"]);
         let branch = git(path, &["branch", "--show-current"]);
+        let participant_id = assignment
+            .as_ref()
+            .map(|assignment| assignment.to_participant_id.clone())
+            .or_else(|| {
+                context
+                    .participants
+                    .first()
+                    .map(|participant| participant.id.clone())
+            })
+            .ok_or_else(|| AdapterError::WrongParticipant("missing participant".into()))?;
+        let request = WorkRequest {
+            work_id: context.work.id.clone(),
+            participant_id,
+            context_version: WORK_CONTEXT_VERSION,
+            revision: context.revision,
+            requested_action: if assignment.is_some() {
+                WorkAction::Execute
+            } else {
+                WorkAction::Inspect
+            },
+        };
         Ok(Self {
             schema: "combe.work-context.v2".into(),
             repository: RepositoryContext {
@@ -96,13 +121,17 @@ impl ContextPackage {
                 "Inspect the real worktree; repository files are authoritative.".into(),
                 "Do not treat terminal or provider session state as durable Work context.".into(),
             ],
+            request,
         })
     }
 
     pub fn text(&self) -> String {
         let context = &self.context;
         let mut output = format!(
-            "COMBE_WORK_CONTEXT\nversion: 2\nwork_id: {}\ntitle: {}\nobjective: {}\nstatus: {:?}\nworkspace_id: {}\nworktree_path: {}\nrepository_root: {}\nbranch: {}\n",
+            "COMBE_WORK_CONTEXT\nversion: 2\nrevision: {}\nparticipant_id: {}\nrequested_action: {:?}\nwork_id: {}\ntitle: {}\nobjective: {}\nstatus: {:?}\nworkspace_id: {}\nworktree_path: {}\nrepository_root: {}\nbranch: {}\n",
+            self.request.revision,
+            self.request.participant_id,
+            self.request.requested_action,
             context.work.id,
             context.work.title,
             context.work.objective.as_deref().unwrap_or(""),
@@ -145,6 +174,18 @@ impl ContextPackage {
             output.push_str(&format!(
                 "- {} [{:?}] by {}: {}\n",
                 proposal.id, proposal.status, proposal.proposed_by, proposal.title
+            ));
+        }
+        output.push_str("\nPARTICIPANTS\n");
+        for participant in &context.participants {
+            output.push_str(&format!(
+                "- {} {} propose={} review={} execute={} decide={}\n",
+                participant.id,
+                participant.name,
+                participant.capabilities.can_propose,
+                participant.capabilities.can_review,
+                participant.capabilities.can_execute,
+                participant.capabilities.can_decide
             ));
         }
         output.push_str("\nPENDING REVIEWS\n");
@@ -205,6 +246,18 @@ impl ContextPackage {
                 result.execution_id,
                 result.exit_status,
                 result.summary.as_deref().unwrap_or("")
+            ));
+        }
+        output.push_str("\nEXECUTION REVIEWS\n");
+        for review in &context.execution_reviews {
+            output.push_str(&format!(
+                "- {} execution={} assignment={} reviewer={} revision={}: {}\n",
+                review.id,
+                review.execution_id,
+                review.assignment_id,
+                review.reviewed_by,
+                review.context_revision,
+                review.content
             ));
         }
         output.push_str("\nCONSTRAINTS\n");
@@ -327,11 +380,12 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use combe_state::{
-        AssignmentId, AssignmentStatus, ConversationId, ConversationProvider, ConversationRef,
-        ExecutionId, ExecutionStatus, FeltDbWorkStore, ParticipantId, ParticipantKind,
-        ParticipantResult, ProposalId, ProposalReview, ProposalStatus, ReviewId, ReviewOutcome,
-        TurnId, TurnKind, TurnOrigin, Work, WorkConversation, WorkExecution, WorkId, WorkProposal,
-        WorkStatus, WorkStore, WorkTurn,
+        ArtifactId, ArtifactKind, AssignmentId, AssignmentStatus, ContributionAcceptance,
+        ContributionKind, ConversationId, ConversationProvider, ConversationRef, ExecutionId,
+        ExecutionStatus, FeltDbWorkStore, ParticipantId, ParticipantKind, ParticipantResult,
+        ProposalId, ProposalReview, ProposalStatus, ReviewId, ReviewOutcome, TurnId, TurnKind,
+        TurnOrigin, Work, WorkArtifact, WorkContribution, WorkConversation, WorkExecution, WorkId,
+        WorkProposal, WorkStatus, WorkStore, WorkTurn,
     };
     use tempfile::TempDir;
 
@@ -356,12 +410,24 @@ mod tests {
             work_id: work.id.clone(),
             kind: ParticipantKind::Human,
             name: "Human".into(),
+            capabilities: combe_state::ParticipantCapabilities {
+                can_propose: true,
+                can_review: true,
+                can_execute: false,
+                can_decide: true,
+            },
         };
         let agent = Participant {
             id: ParticipantId("agent-1".into()),
             work_id: work.id.clone(),
             kind: ParticipantKind::Agent,
             name: "Codex".into(),
+            capabilities: combe_state::ParticipantCapabilities {
+                can_propose: true,
+                can_review: true,
+                can_execute: true,
+                can_decide: false,
+            },
         };
         let assignment = WorkAssignment {
             id: AssignmentId("assignment-1".into()),
@@ -374,6 +440,8 @@ mod tests {
             proposal_id: None,
         };
         let context = WorkContext {
+            context_version: WORK_CONTEXT_VERSION,
+            revision: 1,
             work,
             participants: vec![human, agent.clone()],
             recent_turns: Vec::new(),
@@ -398,6 +466,7 @@ mod tests {
             executions: Vec::new(),
             assignments: Vec::new(),
             results: Vec::new(),
+            execution_reviews: Vec::new(),
         };
         (directory, context, assignment, agent)
     }
@@ -491,12 +560,12 @@ mod tests {
         let proposal = WorkProposal {
             id: ProposalId::new(),
             work_id: context.work.id.clone(),
-            proposed_by: chatgpt.id,
+            proposed_by: chatgpt.id.clone(),
             title: "Preserve the provider-neutral boundary".into(),
             statement: "Implement the assigned check without coupling Work to a provider.".into(),
             rationale: None,
             status: ProposalStatus::Proposed,
-            origin: TurnOrigin::ExternalConversation(reference),
+            origin: TurnOrigin::ExternalConversation(reference.clone()),
             created_at: now,
             updated_at: now,
         };
@@ -513,6 +582,7 @@ mod tests {
             })
             .unwrap();
         assignment.proposal_id = Some(proposal.id.clone());
+        assignment.instruction = "Create protocol-review-proof.txt containing COMBE_PROTOCOL_OK, then reply COMBE_HANDOFF_OK.".into();
         store.add_assignment(assignment.clone()).unwrap();
         let adapter = LocalCliAdapter::discover(LocalProvider::Codex).unwrap();
         let prepared = adapter
@@ -551,6 +621,14 @@ mod tests {
         let result = adapter.launch(prepared).unwrap();
         assert_eq!(result.exit_status, Some(0));
         assert!(result.stdout.contains("COMBE_HANDOFF_OK"));
+        assert_eq!(
+            std::fs::read_to_string(
+                std::path::Path::new(&context.work.workspace_id).join("protocol-review-proof.txt")
+            )
+            .unwrap()
+            .trim(),
+            "COMBE_PROTOCOL_OK"
+        );
         let now = Utc::now();
         execution.status = ExecutionStatus::Completed;
         execution.provider_execution_id = Some(result.execution_id);
@@ -570,7 +648,7 @@ mod tests {
         let turn = WorkTurn {
             id: TurnId::new(),
             work_id: assignment.work_id.clone(),
-            participant_id: agent.id,
+            participant_id: agent.id.clone(),
             kind: TurnKind::Implementation,
             content: result.stdout,
             created_at: now,
@@ -583,9 +661,37 @@ mod tests {
                 execution.clone(),
                 Some(participant_result),
                 Some(turn),
-                Vec::new(),
+                vec![WorkArtifact {
+                    id: ArtifactId::new(),
+                    work_id: assignment.work_id.clone(),
+                    kind: ArtifactKind::File,
+                    path: Some("protocol-review-proof.txt".into()),
+                    description: Some("Created by the real Codex protocol workflow".into()),
+                    created_by: agent.id.clone(),
+                    created_at: now,
+                }],
             )
             .unwrap();
+        let review_revision = store.current_revision().unwrap();
+        let review = store
+            .accept_contribution(WorkContribution {
+                work_id: assignment.work_id.clone(),
+                participant_id: chatgpt.id,
+                context_version: WORK_CONTEXT_VERSION,
+                based_on_revision: review_revision,
+                source: TurnOrigin::ExternalConversation(reference),
+                kind: ContributionKind::Review,
+                content: "ChatGPT confirms the execution satisfies the assignment.".into(),
+                title: None,
+                rationale: None,
+                review_outcome: None,
+                proposal_id: None,
+                assignment_id: Some(assignment.id.clone()),
+                execution_id: Some(execution.id.clone()),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        assert!(matches!(review, ContributionAcceptance::ExecutionReview(_)));
         drop(store);
         let reopened = FeltDbWorkStore::open(database_path).unwrap();
         let restored = reopened.context(&assignment.work_id).unwrap();
@@ -598,6 +704,11 @@ mod tests {
         assert!(restored.active_assignments.is_empty());
         assert_eq!(restored.executions[0].status, ExecutionStatus::Completed);
         assert_eq!(restored.executions[0].assignment_id, assignment.id);
+        assert_eq!(restored.execution_reviews.len(), 1);
+        assert_eq!(
+            restored.artifacts[0].path.as_deref(),
+            Some("protocol-review-proof.txt")
+        );
         assert_eq!(restored.conversations.len(), 1);
         assert_eq!(restored.state.approved_proposals.len(), 1);
         assert_eq!(restored.decisions[0].proposal_id, Some(proposal.id));

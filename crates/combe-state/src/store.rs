@@ -1,4 +1,4 @@
-use crate::{Pane, Tab, Workspace, WorkspaceState, Result};
+use crate::{Pane, Result, Tab, Workspace, WorkspaceState};
 
 pub trait WorkspaceStore: Send + Sync {
     fn load_state(&self) -> Result<WorkspaceState>;

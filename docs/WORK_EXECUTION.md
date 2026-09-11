@@ -15,3 +15,5 @@ The preserved chain is:
 `Conversation → Proposal → Proposal review → Decision → Assignment → Execution → result/Turn → Artifacts`
 
 The CLI exposes `work start`, `work status`, `work heartbeat`, `work complete`, `work fail`, and `work cancel`. Installed Codex and Claude handoffs use the same canonical transitions as every other provider.
+
+A participant may review a terminal Execution through the Work protocol. The resulting Execution review identifies its Work, Assignment, Execution, reviewer, source, and originating context revision. It is evidence for a later Proposal or Decision, not automatic approval.
