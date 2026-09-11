@@ -1,23 +1,23 @@
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::time::Duration;
-use std::{fmt::Write as _, fs};
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use combe_state::{
+    AiContextEventData, AiContinuityStore, AiExchangeStatus, AiMessage, AiParticipant,
+    AiProviderExchange, AiProviderUsage, ContextAssembler, ContextPackage, ContextRequest,
     CredentialRef, FeltDbWorkStore, FeltDbWorkspaceStore, MessageId, ProviderProfile,
     ProviderRegistry, ProviderResult, ProviderResultStatus, ProviderService, ProviderUsage,
     RecipientId, RoutedProviderResult, WorkId, WorkMessage, WorkStore, WorkspaceStore,
+    new_ai_event,
 };
 use serde_json::{Value, json};
 
 use crate::credential_store::{Credential, CredentialError, CredentialStore};
-use crate::participant_adapter::ContextPackage;
 
 const RESULT_LIMIT: usize = 64 * 1024;
 const PROVIDER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const PROVIDER_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(3);
-const REPOSITORY_SNAPSHOT_LIMIT: usize = 32 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RoutingError {
@@ -37,12 +37,13 @@ pub enum RoutingError {
     MissingTransport(ProviderService),
     #[error("provider request failed: {0}")]
     Transport(String),
-    #[error("Work context could not be prepared: {0}")]
-    Context(String),
 }
 
 pub trait ProviderAdapter: Send + Sync {
     fn service(&self) -> ProviderService;
+    fn supports(&self, profile: &ProviderProfile) -> bool {
+        self.service() == profile.service
+    }
     fn send(
         &self,
         profile: &ProviderProfile,
@@ -50,11 +51,48 @@ pub trait ProviderAdapter: Send + Sync {
         message: &str,
         credential: Option<&Credential>,
     ) -> Result<ProviderResult, RoutingError>;
+    fn send_request(
+        &self,
+        request: &ProviderRequest<'_>,
+        credential: Option<&Credential>,
+    ) -> Result<ProviderResult, RoutingError> {
+        let message = request.context.provider_text()?;
+        self.send(request.profile, request.worktree, &message, credential)
+    }
+    fn send_stream(
+        &self,
+        profile: &ProviderProfile,
+        worktree: &Path,
+        message: &str,
+        credential: Option<&Credential>,
+        events: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<ProviderResult, RoutingError> {
+        events(ProviderStreamEvent::Started);
+        let result = self.send(profile, worktree, message, credential)?;
+        if !result.content.is_empty() {
+            events(ProviderStreamEvent::Delta(result.content.clone()));
+        }
+        events(ProviderStreamEvent::Completed);
+        Ok(result)
+    }
     fn test(
         &self,
         profile: &ProviderProfile,
         credential: Option<&Credential>,
     ) -> Result<String, RoutingError>;
+}
+
+pub struct ProviderRequest<'a> {
+    pub profile: &'a ProviderProfile,
+    pub worktree: &'a Path,
+    pub context: &'a ContextPackage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderStreamEvent {
+    Started,
+    Delta(String),
+    Completed,
 }
 
 pub trait MessageRouter {
@@ -87,19 +125,36 @@ impl<'a> RoutingService<'a> {
 
     pub fn test_profile(&self, profile: &ProviderProfile) -> Result<String, RoutingError> {
         let credential = self.credential(profile)?;
-        self.adapter(profile.service)?
-            .test(profile, credential.as_ref())
+        self.adapter(profile)?.test(profile, credential.as_ref())
     }
 
-    fn adapter(&self, service: ProviderService) -> Result<&dyn ProviderAdapter, RoutingError> {
+    pub fn preview_context(
+        &self,
+        work_id: &WorkId,
+        recipient_id: &RecipientId,
+        message: &str,
+    ) -> Result<ContextPackage, RoutingError> {
+        Ok(ContextAssembler::assemble(
+            self.store,
+            &ContextRequest::new(work_id.clone(), recipient_id.clone(), message),
+        )?)
+    }
+
+    pub(crate) fn adapter(
+        &self,
+        profile: &ProviderProfile,
+    ) -> Result<&dyn ProviderAdapter, RoutingError> {
         self.adapters
             .iter()
             .copied()
-            .find(|adapter| adapter.service() == service)
-            .ok_or(RoutingError::MissingTransport(service))
+            .find(|adapter| adapter.supports(profile))
+            .ok_or(RoutingError::MissingTransport(profile.service))
     }
 
-    fn credential(&self, profile: &ProviderProfile) -> Result<Option<Credential>, RoutingError> {
+    pub(crate) fn credential(
+        &self,
+        profile: &ProviderProfile,
+    ) -> Result<Option<Credential>, RoutingError> {
         profile
             .credential_ref
             .as_ref()
@@ -148,33 +203,77 @@ impl MessageRouter for RoutingService<'_> {
         if !worktree.is_dir() {
             return Err(RoutingError::MissingWorktree(worktree_path));
         }
-        let credential = self.credential(&profile)?;
-        let context = self.store.context(work_id)?;
-        let package = ContextPackage::from_context(context, None)
-            .map_err(|error| RoutingError::Context(error.to_string()))?;
-        let routed_message = format!(
-            "{}\n{}\nROUTED REQUEST\n{}\nEND_ROUTED_REQUEST\n",
-            package.text(),
-            repository_snapshot(worktree),
-            message.trim()
-        );
-        let result = self.adapter(profile.service)?.send(
-            &profile,
-            worktree,
-            &routed_message,
-            credential.as_ref(),
-        )?;
+        let package = self.preview_context(work_id, recipient_id, message)?;
         let sender = self
             .store
             .find_participant(work_id, "Human")?
             .ok_or_else(|| {
                 combe_state::StateError::InvalidEntity("Work has no Human participant".into())
             })?;
+        let conversation_id = format!("work:{}", work_id.0);
+        let existing_events = self.store.ai_events(&conversation_id)?;
+        if existing_events.is_empty() {
+            let participants = self
+                .store
+                .participants(work_id)?
+                .into_iter()
+                .map(|participant| AiParticipant {
+                    id: participant.id.0,
+                    name: participant.name,
+                    role: format!("{:?}", participant.kind).to_lowercase(),
+                })
+                .collect();
+            self.store.append_ai_event(new_ai_event(
+                &conversation_id,
+                AiContextEventData::ConversationCreated {
+                    participants,
+                    summary: work.objective.clone().unwrap_or_else(|| work.title.clone()),
+                },
+            ))?;
+        }
+        if !existing_events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AiContextEventData::WorkLinked { work_id: linked } if linked == work_id
+            )
+        }) {
+            self.store.append_ai_event(new_ai_event(
+                &conversation_id,
+                AiContextEventData::WorkLinked {
+                    work_id: work_id.clone(),
+                },
+            ))?;
+        }
+        let input_message_id = uuid::Uuid::new_v4().to_string();
+        let input_created_at = Utc::now();
+        self.store.append_ai_event(new_ai_event(
+            &conversation_id,
+            AiContextEventData::MessageCreated {
+                message: AiMessage {
+                    id: input_message_id.clone(),
+                    participant_id: sender.id.0.clone(),
+                    role: "user".into(),
+                    content: message.trim().into(),
+                    created_at: input_created_at,
+                    completed_at: None,
+                    source: None,
+                },
+            },
+        ))?;
+        self.store.append_ai_event(new_ai_event(
+            &conversation_id,
+            AiContextEventData::MessageCompleted {
+                message_id: input_message_id.clone(),
+                content: message.trim().into(),
+                completed_at: Utc::now(),
+            },
+        ))?;
+        let provider = provider_name(profile.service).to_string();
         let message_id = MessageId::new();
         self.store.add_message(WorkMessage {
             id: message_id.clone(),
             work_id: work_id.clone(),
-            sender_participant_id: sender.id,
+            sender_participant_id: sender.id.clone(),
             recipient_id: recipient.id.clone(),
             provider_profile_id: profile.id.clone(),
             service: profile.service,
@@ -183,6 +282,183 @@ impl MessageRouter for RoutingService<'_> {
             content: message.into(),
             created_at: Utc::now(),
         })?;
+        let started = Instant::now();
+        let result = self.credential(&profile).and_then(|credential| {
+            self.adapter(&profile)?.send_request(
+                &ProviderRequest {
+                    profile: &profile,
+                    worktree,
+                    context: &package,
+                },
+                credential.as_ref(),
+            )
+        });
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                let output_message_id = uuid::Uuid::new_v4().to_string();
+                let detail = error.to_string();
+                self.store.append_ai_event(new_ai_event(
+                    &conversation_id,
+                    AiContextEventData::MessageCreated {
+                        message: AiMessage {
+                            id: output_message_id.clone(),
+                            participant_id: recipient.id.0.clone(),
+                            role: "assistant".into(),
+                            content: detail.clone(),
+                            created_at: Utc::now(),
+                            completed_at: None,
+                            source: None,
+                        },
+                    },
+                ))?;
+                self.store.append_ai_event(new_ai_event(
+                    &conversation_id,
+                    AiContextEventData::MessageCompleted {
+                        message_id: output_message_id.clone(),
+                        content: detail.clone(),
+                        completed_at: Utc::now(),
+                    },
+                ))?;
+                self.store.record_ai_exchange(AiProviderExchange {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    provider,
+                    service: provider_name(profile.service).into(),
+                    model: profile.model.clone(),
+                    conversation_id,
+                    work_id: Some(work_id.clone()),
+                    recipient_id: Some(recipient.id.clone()),
+                    provider_profile_id: Some(profile.id.clone()),
+                    execution_mode: Some(profile.execution_mode),
+                    context_fingerprint: package.fingerprint.clone(),
+                    context_items: package.items.iter().map(|item| item.id.clone()).collect(),
+                    context_bytes: package.bytes,
+                    input_message_id,
+                    output_message_id,
+                    request_id: None,
+                    usage: None,
+                    status: AiExchangeStatus::Failed,
+                    duration_ms: Some(started.elapsed().as_millis() as u64),
+                    error: Some(detail.clone()),
+                    created_at: Utc::now(),
+                })?;
+                self.store.add_provider_result(RoutedProviderResult {
+                    message_id,
+                    work_id: work_id.clone(),
+                    recipient_id: recipient.id,
+                    provider_profile_id: profile.id.clone(),
+                    service: profile.service,
+                    model: profile.model.clone(),
+                    execution_mode: profile.execution_mode,
+                    result: ProviderResult {
+                        provider_profile_id: profile.id,
+                        model: profile.model,
+                        content: detail,
+                        status: ProviderResultStatus::Failed,
+                        usage: None,
+                        provider_request_id: None,
+                    },
+                    created_at: Utc::now(),
+                })?;
+                return Err(error);
+            }
+        };
+        if result.status != ProviderResultStatus::ManualTransferRequired {
+            let output_message_id = uuid::Uuid::new_v4().to_string();
+            self.store.append_ai_event(new_ai_event(
+                &conversation_id,
+                AiContextEventData::MessageCreated {
+                    message: AiMessage {
+                        id: output_message_id.clone(),
+                        participant_id: recipient.id.0.clone(),
+                        role: "assistant".into(),
+                        content: result.content.clone(),
+                        created_at: Utc::now(),
+                        completed_at: None,
+                        source: None,
+                    },
+                },
+            ))?;
+            self.store.append_ai_event(new_ai_event(
+                &conversation_id,
+                AiContextEventData::MessageCompleted {
+                    message_id: output_message_id.clone(),
+                    content: result.content.clone(),
+                    completed_at: Utc::now(),
+                },
+            ))?;
+            self.store.record_ai_exchange(AiProviderExchange {
+                id: uuid::Uuid::new_v4().to_string(),
+                provider,
+                service: provider_name(profile.service).into(),
+                model: profile.model.clone(),
+                conversation_id,
+                work_id: Some(work_id.clone()),
+                recipient_id: Some(recipient.id.clone()),
+                provider_profile_id: Some(profile.id.clone()),
+                execution_mode: Some(profile.execution_mode),
+                context_fingerprint: package.fingerprint.clone(),
+                context_items: package.items.iter().map(|item| item.id.clone()).collect(),
+                context_bytes: package.bytes,
+                input_message_id,
+                output_message_id,
+                request_id: result.provider_request_id.clone(),
+                usage: result.usage.as_ref().map(|usage| AiProviderUsage {
+                    input_tokens: usage.input_tokens,
+                    output_tokens: usage.output_tokens,
+                }),
+                status: AiExchangeStatus::Completed,
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+                error: None,
+                created_at: Utc::now(),
+            })?;
+        } else {
+            let output_message_id = uuid::Uuid::new_v4().to_string();
+            self.store.append_ai_event(new_ai_event(
+                &conversation_id,
+                AiContextEventData::MessageCreated {
+                    message: AiMessage {
+                        id: output_message_id.clone(),
+                        participant_id: recipient.id.0.clone(),
+                        role: "assistant".into(),
+                        content: result.content.clone(),
+                        created_at: Utc::now(),
+                        completed_at: None,
+                        source: None,
+                    },
+                },
+            ))?;
+            self.store.append_ai_event(new_ai_event(
+                &conversation_id,
+                AiContextEventData::MessageCompleted {
+                    message_id: output_message_id.clone(),
+                    content: result.content.clone(),
+                    completed_at: Utc::now(),
+                },
+            ))?;
+            self.store.record_ai_exchange(AiProviderExchange {
+                id: uuid::Uuid::new_v4().to_string(),
+                provider,
+                service: provider_name(profile.service).into(),
+                model: profile.model.clone(),
+                conversation_id,
+                work_id: Some(work_id.clone()),
+                recipient_id: Some(recipient.id.clone()),
+                provider_profile_id: Some(profile.id.clone()),
+                execution_mode: Some(profile.execution_mode),
+                context_fingerprint: package.fingerprint.clone(),
+                context_items: package.items.iter().map(|item| item.id.clone()).collect(),
+                context_bytes: package.bytes,
+                input_message_id: input_message_id.clone(),
+                output_message_id,
+                request_id: None,
+                usage: None,
+                status: AiExchangeStatus::ManualTransferRequired,
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+                error: None,
+                created_at: Utc::now(),
+            })?;
+        }
         self.store.add_provider_result(RoutedProviderResult {
             message_id,
             work_id: work_id.clone(),
@@ -195,6 +471,15 @@ impl MessageRouter for RoutingService<'_> {
             created_at: Utc::now(),
         })?;
         Ok(result)
+    }
+}
+
+pub(crate) fn provider_name(service: ProviderService) -> &'static str {
+    match service {
+        ProviderService::Ollama => "ollama",
+        ProviderService::ClaudeCode => "claude",
+        ProviderService::ChatGpt => "chatgpt",
+        ProviderService::OpenAiApi => "openai",
     }
 }
 
@@ -316,6 +601,135 @@ pub struct OpenAiAdapter {
     client: reqwest::blocking::Client,
 }
 
+pub struct ChatGptProvider {
+    client: reqwest::blocking::Client,
+}
+
+impl ChatGptProvider {
+    pub fn new() -> Self {
+        Self {
+            client: reqwest::blocking::Client::builder()
+                .timeout(PROVIDER_REQUEST_TIMEOUT)
+                .build()
+                .expect("HTTP client configuration is valid"),
+        }
+    }
+}
+
+impl ProviderAdapter for ChatGptProvider {
+    fn service(&self) -> ProviderService {
+        ProviderService::ChatGpt
+    }
+
+    fn supports(&self, profile: &ProviderProfile) -> bool {
+        profile.service == ProviderService::ChatGpt
+            && profile.execution_mode == combe_state::ExecutionMode::HttpApi
+    }
+
+    fn send(
+        &self,
+        profile: &ProviderProfile,
+        worktree: &Path,
+        message: &str,
+        credential: Option<&Credential>,
+    ) -> Result<ProviderResult, RoutingError> {
+        self.send_stream(profile, worktree, message, credential, &mut |_| {})
+    }
+
+    fn send_stream(
+        &self,
+        profile: &ProviderProfile,
+        _worktree: &Path,
+        message: &str,
+        credential: Option<&Credential>,
+        events: &mut dyn FnMut(ProviderStreamEvent),
+    ) -> Result<ProviderResult, RoutingError> {
+        use std::io::BufRead;
+
+        let model = required_model(profile)?;
+        let key = credential.ok_or_else(|| missing_credential(profile))?;
+        let key = std::str::from_utf8(key.expose())
+            .map_err(|_| RoutingError::Transport("OpenAI credential is invalid".into()))?;
+        events(ProviderStreamEvent::Started);
+        let response = self
+            .client
+            .post("https://api.openai.com/v1/responses")
+            .bearer_auth(key)
+            .json(&json!({ "model": model, "input": message, "store": false, "stream": true }))
+            .send()
+            .map_err(transport)?
+            .error_for_status()
+            .map_err(transport)?;
+        let header_request_id = response
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let mut content = String::new();
+        let mut request_id = header_request_id;
+        let mut usage = None;
+        for line in std::io::BufReader::new(response).lines() {
+            let line = line.map_err(|error| RoutingError::Transport(error.to_string()))?;
+            let Some(data) = line.strip_prefix("data: ") else {
+                continue;
+            };
+            if data == "[DONE]" {
+                break;
+            }
+            let value: Value = serde_json::from_str(data).map_err(|_| {
+                RoutingError::Transport("ChatGPT returned invalid stream data".into())
+            })?;
+            match value.get("type").and_then(Value::as_str) {
+                Some("response.output_text.delta") => {
+                    if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                        content.push_str(delta);
+                        events(ProviderStreamEvent::Delta(delta.into()));
+                    }
+                }
+                Some("response.completed") => {
+                    let response = value.get("response").unwrap_or(&value);
+                    request_id = request_id.or_else(|| {
+                        response
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    });
+                    usage = response.get("usage").map(|usage| ProviderUsage {
+                        input_tokens: usage.get("input_tokens").and_then(Value::as_u64),
+                        output_tokens: usage.get("output_tokens").and_then(Value::as_u64),
+                    });
+                }
+                Some("error" | "response.failed") => {
+                    let message = value
+                        .pointer("/error/message")
+                        .or_else(|| value.get("message"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("ChatGPT response stream failed");
+                    return Err(RoutingError::Transport(bounded(message)));
+                }
+                _ => {}
+            }
+        }
+        events(ProviderStreamEvent::Completed);
+        Ok(ProviderResult {
+            provider_profile_id: profile.id.clone(),
+            model: profile.model.clone(),
+            content: bounded(&content),
+            status: ProviderResultStatus::Completed,
+            usage,
+            provider_request_id: request_id,
+        })
+    }
+
+    fn test(
+        &self,
+        profile: &ProviderProfile,
+        credential: Option<&Credential>,
+    ) -> Result<String, RoutingError> {
+        OpenAiAdapter::new().test(profile, credential)
+    }
+}
+
 impl OpenAiAdapter {
     pub fn new() -> Self {
         Self {
@@ -400,6 +814,24 @@ impl ProviderAdapter for OpenAiAdapter {
 
 pub struct ClaudeCodeAdapter;
 
+impl ClaudeCodeAdapter {
+    pub fn authentication_status() -> Result<String, RoutingError> {
+        let executable = which::which("claude")
+            .map_err(|_| RoutingError::Transport("Claude Code CLI was not found in PATH".into()))?;
+        let output = Command::new(executable)
+            .args(["auth", "status"])
+            .output()
+            .map_err(|error| RoutingError::Transport(error.to_string()))?;
+        if output.status.success() {
+            return Ok("Claude Code is signed in through its installed CLI account.".into());
+        }
+        Err(RoutingError::Transport(
+            "Claude Code is not signed in. Choose Sign In in Terminal and complete the browser login."
+                .into(),
+        ))
+    }
+}
+
 impl ProviderAdapter for ClaudeCodeAdapter {
     fn service(&self) -> ProviderService {
         ProviderService::ClaudeCode
@@ -457,9 +889,7 @@ impl ProviderAdapter for ClaudeCodeAdapter {
         _profile: &ProviderProfile,
         _credential: Option<&Credential>,
     ) -> Result<String, RoutingError> {
-        which::which("claude")
-            .map(|_| "CLI found".into())
-            .map_err(|_| RoutingError::Transport("Claude Code CLI was not found in PATH".into()))
+        Self::authentication_status()
     }
 }
 
@@ -468,6 +898,11 @@ pub struct ChatGptManualAdapter;
 impl ProviderAdapter for ChatGptManualAdapter {
     fn service(&self) -> ProviderService {
         ProviderService::ChatGpt
+    }
+
+    fn supports(&self, profile: &ProviderProfile) -> bool {
+        profile.service == ProviderService::ChatGpt
+            && profile.execution_mode == combe_state::ExecutionMode::ExternalManual
     }
 
     fn send(
@@ -552,51 +987,6 @@ fn bounded(value: &str) -> String {
     value[..end].into()
 }
 
-fn repository_snapshot(worktree: &Path) -> String {
-    let root = worktree.canonicalize().ok();
-    let mut output = String::from("REPOSITORY ORIENTATION\n");
-    for name in [
-        "README.md",
-        "README",
-        "package.json",
-        "Cargo.toml",
-        "pyproject.toml",
-        "go.mod",
-        "Package.swift",
-    ] {
-        let path = worktree.join(name);
-        let Some(root) = root.as_ref() else { break };
-        let Ok(resolved) = path.canonicalize() else {
-            continue;
-        };
-        if !resolved.starts_with(root) || !resolved.is_file() {
-            continue;
-        }
-        let Ok(content) = fs::read_to_string(&resolved) else {
-            continue;
-        };
-        let remaining = REPOSITORY_SNAPSHOT_LIMIT.saturating_sub(output.len());
-        if remaining == 0 {
-            break;
-        }
-        let content = bounded_to(&content, remaining.saturating_sub(name.len() + 8));
-        let _ = write!(output, "\nFILE {name}\n{content}\n");
-    }
-    output.push_str("END_REPOSITORY_ORIENTATION\n");
-    output
-}
-
-fn bounded_to(value: &str, limit: usize) -> &str {
-    if value.len() <= limit {
-        return value;
-    }
-    let mut end = limit;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
@@ -612,6 +1002,7 @@ mod tests {
 
     struct RecordingAdapter {
         calls: Mutex<Vec<(String, String)>>,
+        status: ProviderResultStatus,
     }
 
     impl ProviderAdapter for RecordingAdapter {
@@ -634,7 +1025,7 @@ mod tests {
                 provider_profile_id: profile.id.clone(),
                 model: None,
                 content: message.into(),
-                status: ProviderResultStatus::ManualTransferRequired,
+                status: self.status,
                 usage: None,
                 provider_request_id: None,
             })
@@ -654,7 +1045,28 @@ mod tests {
         let directory = TempDir::new().unwrap();
         std::fs::write(
             directory.path().join("README.md"),
-            "# Routed project\nProvider-neutral coordination.",
+            "# Routed project\nA service package for authenticated application APIs.",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("package.json"),
+            r#"{"name":"routed-project","dependencies":{"jsonwebtoken":"latest"}}"#,
+        )
+        .unwrap();
+        std::fs::create_dir(directory.path().join("src")).unwrap();
+        std::fs::write(
+            directory.path().join("src/auth.ts"),
+            "export function authenticate(token: string) { return verify(token); }",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join("src/unrelated.ts"),
+            "export const color = 'blue';",
+        )
+        .unwrap();
+        std::fs::write(
+            directory.path().join(".env"),
+            "OPENAI_API_KEY=sk-private-secret",
         )
         .unwrap();
         let store = FeltDbWorkStore::open(directory.path().join("work.db")).unwrap();
@@ -698,20 +1110,129 @@ mod tests {
         store.create_recipient(recipient.clone()).unwrap();
         let adapter = RecordingAdapter {
             calls: Mutex::new(Vec::new()),
+            status: ProviderResultStatus::Completed,
         };
         let credentials = MemoryCredentialStore::new();
         let router = RoutingService::new(&store, &credentials, vec![&adapter]);
 
-        router
-            .send(&work.id, &recipient.id, "Review the completed change")
+        let question = "What does this repository do and how is authentication implemented?";
+        let first = router
+            .preview_context(&work.id, &recipient.id, question)
             .unwrap();
+        let second = router
+            .preview_context(&work.id, &recipient.id, question)
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.items[0].kind, combe_state::ContextNodeKind::Work);
+        assert!(
+            first
+                .items
+                .iter()
+                .any(|item| item.kind == combe_state::ContextNodeKind::Worktree)
+        );
+        assert!(first.bytes <= combe_state::DEFAULT_CONTEXT_BYTES);
+        assert!(first.items.iter().any(|item| {
+            item.reference == "README.md"
+                && item
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("service package"))
+        }));
+        assert!(first.items.iter().any(|item| {
+            item.reference == "package.json"
+                && item
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("jsonwebtoken"))
+        }));
+        assert!(first.items.iter().any(|item| {
+            item.reference == "src/auth.ts"
+                && item
+                    .content
+                    .as_deref()
+                    .is_some_and(|content| content.contains("authenticate"))
+        }));
+        assert!(
+            !first
+                .items
+                .iter()
+                .any(|item| item.reference.contains(".env"))
+        );
+        assert!(
+            !first
+                .items
+                .iter()
+                .any(|item| item.reference == "src/unrelated.ts")
+        );
+        std::fs::write(
+            directory.path().join("README.md"),
+            "# Routed project\nA changed authenticated API service.",
+        )
+        .unwrap();
+        let changed = router
+            .preview_context(&work.id, &recipient.id, question)
+            .unwrap();
+        assert_ne!(first.fingerprint, changed.fingerprint);
+
+        store
+            .set_context_file_hint(combe_state::WorkContextFileHint {
+                work_id: work.id.clone(),
+                path: "src/unrelated.ts".into(),
+                disposition: combe_state::ContextFileDisposition::Include,
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        store
+            .set_context_file_hint(combe_state::WorkContextFileHint {
+                work_id: work.id.clone(),
+                path: "src/auth.ts".into(),
+                disposition: combe_state::ContextFileDisposition::Exclude,
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        let hinted = router
+            .preview_context(&work.id, &recipient.id, question)
+            .unwrap();
+        assert!(
+            hinted
+                .items
+                .iter()
+                .any(|item| item.reference == "src/unrelated.ts")
+        );
+        assert!(
+            !hinted
+                .items
+                .iter()
+                .any(|item| item.reference == "src/auth.ts")
+        );
+        store
+            .set_context_file_hint(combe_state::WorkContextFileHint {
+                work_id: work.id.clone(),
+                path: "src/auth.ts".into(),
+                disposition: combe_state::ContextFileDisposition::Include,
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+        store
+            .set_context_file_hint(combe_state::WorkContextFileHint {
+                work_id: work.id.clone(),
+                path: "src/unrelated.ts".into(),
+                disposition: combe_state::ContextFileDisposition::Exclude,
+                updated_at: Utc::now(),
+            })
+            .unwrap();
+
+        router.send(&work.id, &recipient.id, question).unwrap();
 
         assert_eq!(adapter.calls.lock().unwrap().len(), 1);
         let routed = adapter.calls.lock().unwrap()[0].1.clone();
-        assert!(routed.contains("COMBE_WORK_CONTEXT\nversion: 2"));
-        assert!(routed.contains("title: Routed work"));
-        assert!(routed.contains("FILE README.md\n# Routed project"));
-        assert!(routed.contains("ROUTED REQUEST\nReview the completed change"));
+        assert!(routed.contains("COMBE_CONTEXT_PACKAGE v1"));
+        assert!(routed.contains("\"contract\":\"COMBE_CONTEXT_PACKAGE\""));
+        assert!(routed.contains("\"display\":\"Routed work\""));
+        assert!(routed.contains("\"fingerprint\":"));
+        assert!(routed.contains(question));
+        assert!(routed.contains("A changed authenticated API service"));
+        assert!(routed.contains("export function authenticate"));
         let messages = store.messages(&work.id).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].recipient_id, recipient.id);
@@ -721,6 +1242,14 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_id, messages[0].id);
         assert_eq!(results[0].recipient_id, recipient.id);
+        let exchanges = store.ai_exchanges(&format!("work:{}", work.id.0)).unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].provider, "chatgpt");
+        assert!(!exchanges[0].context_fingerprint.is_empty());
+        assert!(!exchanges[0].context_items.is_empty());
+        assert_eq!(exchanges[0].recipient_id.as_ref(), Some(&recipient.id));
+        assert!(!exchanges[0].input_message_id.is_empty());
+        assert!(!exchanges[0].output_message_id.is_empty());
     }
 
     #[test]
@@ -767,6 +1296,7 @@ mod tests {
         store.create_recipient(recipient.clone()).unwrap();
         let adapter = RecordingAdapter {
             calls: Mutex::new(Vec::new()),
+            status: ProviderResultStatus::Completed,
         };
         let credentials = MemoryCredentialStore::new();
         let router = RoutingService::new(&store, &credentials, vec![&adapter]);
@@ -776,7 +1306,12 @@ mod tests {
             Err(RoutingError::MissingTransport(ProviderService::Ollama))
         ));
         assert!(adapter.calls.lock().unwrap().is_empty());
-        assert!(store.messages(&work.id).unwrap().is_empty());
-        assert!(store.provider_results(&work.id).unwrap().is_empty());
+        assert_eq!(store.messages(&work.id).unwrap().len(), 1);
+        let results = store.provider_results(&work.id).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].result.status, ProviderResultStatus::Failed);
+        let exchanges = store.ai_exchanges(&format!("work:{}", work.id.0)).unwrap();
+        assert_eq!(exchanges.len(), 1);
+        assert_eq!(exchanges[0].status, AiExchangeStatus::Failed);
     }
 }

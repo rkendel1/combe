@@ -1,3 +1,8 @@
+pub mod ai_context;
+pub mod attention;
+pub mod chatgpt_history;
+pub mod context_assembly;
+pub mod context_graph;
 pub mod error;
 pub mod feltdb;
 pub mod filestore;
@@ -14,6 +19,11 @@ pub mod work_store;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub use ai_context::*;
+pub use attention::*;
+pub use chatgpt_history::*;
+pub use context_assembly::*;
+pub use context_graph::*;
 pub use error::{Result, StateError};
 pub use feltdb::FeltDbWorkspaceStore;
 pub use filestore::FileWorkspaceStore;

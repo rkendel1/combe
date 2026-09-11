@@ -2,8 +2,8 @@ use crate::{
     ArtifactId, AssignmentId, ContributionAcceptance, ConversationId, ExecutionReview,
     ExecutionReviewId, Participant, ParticipantId, ParticipantResult, ProposalId, ProposalReview,
     ProposalStatus, Result, ReviewId, TurnId, Work, WorkArtifact, WorkAssignment, WorkContext,
-    WorkContribution, WorkConversation, WorkDecision, WorkExecution, WorkId, WorkProposal,
-    WorkStatus, WorkTurn,
+    WorkContextFileHint, WorkContribution, WorkConversation, WorkDecision, WorkExecution, WorkId,
+    WorkProposal, WorkStatus, WorkTurn,
 };
 
 pub const CONTEXT_TURN_LIMIT: usize = 50;
@@ -35,6 +35,8 @@ pub trait WorkStore: Send + Sync {
     fn decisions(&self, work_id: &WorkId) -> Result<Vec<WorkDecision>>;
     fn add_artifact(&self, artifact: WorkArtifact) -> Result<()>;
     fn artifacts(&self, work_id: &WorkId) -> Result<Vec<WorkArtifact>>;
+    fn set_context_file_hint(&self, hint: WorkContextFileHint) -> Result<()>;
+    fn context_file_hints(&self, work_id: &WorkId) -> Result<Vec<WorkContextFileHint>>;
     fn context(&self, work_id: &WorkId) -> Result<WorkContext>;
     fn find_participant(&self, work_id: &WorkId, name: &str) -> Result<Option<Participant>> {
         Ok(self

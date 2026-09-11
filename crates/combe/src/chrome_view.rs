@@ -19,6 +19,7 @@ pub(crate) struct ClickIvars {
     click: Box<dyn Fn()>,
     label: RefCell<Option<Retained<NSTextField>>>,
     selected: Cell<bool>,
+    filled: Cell<bool>,
     opened: Cell<Option<bool>>,
     dim_when_idle: Cell<bool>,
     text_color: Cell<(u32, u32)>,
@@ -46,6 +47,15 @@ define_class!(
 
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: NSRect) {
+            if self.ivars().filled.get() {
+                color(habits::CHROME_ACTION).setFill();
+                NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                    self.bounds(),
+                    self.ivars().corner_radius.get(),
+                    self.ivars().corner_radius.get(),
+                )
+                .fill();
+            }
             if self.ivars().selected.get() || (self.ivars().hovered.get() && self.ivars().hover_highlight.get()) {
                 color(habits::CHROME_SELECTION).setFill();
                 NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
@@ -185,6 +195,7 @@ impl ClickView {
             click: Box::new(click),
             label: RefCell::new(None),
             selected: Cell::new(false),
+            filled: Cell::new(false),
             opened: Cell::new(None),
             dim_when_idle: Cell::new(false),
             text_color: Cell::new(habits::CHROME_TEXT),
@@ -258,6 +269,11 @@ impl ClickView {
         self.setAccessibilitySelected(selected);
         self.ivars().selected.set(selected);
         self.apply_label_color();
+        self.setNeedsDisplay(true);
+    }
+
+    pub(crate) fn set_filled(&self, filled: bool) {
+        self.ivars().filled.set(filled);
         self.setNeedsDisplay(true);
     }
 

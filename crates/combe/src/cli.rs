@@ -11,23 +11,25 @@ use crate::participant_adapter::{
     ContextPackage, LocalCliAdapter, LocalProvider, ParticipantAdapter,
 };
 use crate::provider_router::{
-    ChatGptManualAdapter, ClaudeCodeAdapter, MessageRouter, OllamaAdapter, OpenAiAdapter,
-    RoutingService,
+    ChatGptManualAdapter, ChatGptProvider, ClaudeCodeAdapter, MessageRouter, OllamaAdapter,
+    OpenAiAdapter, RoutingService,
 };
 use chrono::Utc;
 use combe_catalog::{
     Catalog, State, add_repo, catalog, cleanup, load_state, remove_repo, save_state, state_path,
 };
 use combe_state::{
-    ArtifactId, ArtifactKind, AssignmentId, AssignmentStatus, ContributionAcceptance,
+    AiContextEventData, AiContinuityStore, AiProviderExchange, ArtifactId, ArtifactKind,
+    AssignmentId, AssignmentStatus, ChatGptHistoryStore, ContextAssembler, ContextGraph,
+    ContextGraphProjector, ContextGraphStore, ContextRequest, ContributionAcceptance,
     ContributionKind, ConversationId, ConversationProvider, ConversationRef, CredentialRef,
     ExecutionId, ExecutionMode, ExecutionStatus, FeltDbWorkStore, FeltDbWorkspaceStore,
-    Participant, ParticipantKind, ParticipantResult, ProposalId, ProposalReview, ProposalStatus,
-    ProviderCapabilities, ProviderProfile, ProviderProfileId, ProviderRegistry, ProviderService,
-    Recipient, RecipientId, ReviewId, ReviewOutcome, TurnId, TurnKind, TurnOrigin,
+    GraphQueryOptions, Participant, ParticipantKind, ParticipantResult, ProposalId, ProposalReview,
+    ProposalStatus, ProviderCapabilities, ProviderProfile, ProviderProfileId, ProviderRegistry,
+    ProviderService, Recipient, RecipientId, ReviewId, ReviewOutcome, TurnId, TurnKind, TurnOrigin,
     WORK_CONTEXT_VERSION, Work, WorkAction, WorkArtifact, WorkAssignment, WorkContribution,
     WorkConversation, WorkDecision, WorkExecution, WorkId, WorkProposal, WorkStore, WorkTurn,
-    WorkspaceStore,
+    WorkspaceStore, derive_work_attention, derive_work_attention_with_health,
 };
 
 const USAGE: &str = "\
@@ -40,9 +42,16 @@ Usage:
   combe cleanup             Drop registered paths that no longer exist on disk
   combe open <path>         Open or focus a workspace
   combe doctor              Check Combe installation and state
+  combe chatgpt import <export.zip> [--dry-run] [--json] [--search <text>] [--from <date>] [--to <date>] [--conversation <id>]
   combe work list [--workspace <id>]
   combe work create <title> [--workspace <id>] [--objective <text>]
   combe work show <id>
+  combe work activity <id> [--json]
+  combe work exchange <exchange-id> [--json]
+  combe work result <exchange-id> [--json]
+  combe work next <work-id> [--json]
+  combe work attention <work-id> [--json]
+  combe work attention --all [--json]
   combe work context <id> [--format <text|json>]
   combe work protocol <id> [--participant <name-or-id>] [--action <action>] [--format <text|json>]
   combe work chatgpt <id> [--action <inspect|propose|review>] [--conversation <id>] [--title <title>]
@@ -70,6 +79,13 @@ Usage:
   combe provider <list|show|create|enable|disable|delete|test|credential-set|credential-delete> ...
   combe recipient <list|show|create|enable|disable|delete> ...
   combe route send <work-id> --to <recipient-id>
+  combe graph status [--json]
+  combe graph rebuild [--dry-run] [--verify] [--work <id>] [--worktree <id>] [--repository <id>] [--json]
+  combe graph verify [--json]
+  combe graph inspect <node-id> [--json]
+  combe graph related <node-id> [--json]
+  combe context <preview|inspect|fingerprint> <work-id> --recipient <id> [--message <text>] [--max-items <n>] [--max-bytes <n>] [--json]
+  combe context diff <work-id> <fingerprint> --recipient <id> [--message <text>] [--json]
   combe version             Show version information
   combe --fresh             Start without restoring previous session
   combe help                Show this help
@@ -94,10 +110,13 @@ pub fn run() -> Option<ExitCode> {
         "cleanup" => Some(clean()),
         "open" => Some(open_workspace(rest)),
         "doctor" => Some(doctor()),
+        "chatgpt" => Some(chatgpt_history(rest)),
         "work" => Some(work(rest)),
         "provider" => Some(provider(rest)),
         "recipient" => Some(recipient(rest)),
         "route" => Some(route(rest)),
+        "graph" => Some(graph(rest)),
+        "context" => Some(context_command(rest)),
         "version" | "-v" | "--version" => Some(version()),
         "--fresh" => None,
         "help" | "-h" | "--help" => {
@@ -109,6 +128,385 @@ pub fn run() -> Option<ExitCode> {
             print_usage();
             Some(ExitCode::from(2))
         }
+    }
+}
+
+fn context_command(args: &[String]) -> ExitCode {
+    let Some(command @ ("preview" | "inspect" | "fingerprint" | "diff")) =
+        args.first().map(String::as_str)
+    else {
+        eprintln!("combe: context needs preview, inspect, fingerprint, or diff");
+        return ExitCode::from(2);
+    };
+    let Some(work_id) = args.get(1).map(|value| WorkId(value.clone())) else {
+        eprintln!("combe: context {command} needs a Work id");
+        return ExitCode::from(2);
+    };
+    let Some(recipient_id) = option(args, "--recipient").map(RecipientId) else {
+        eprintln!("combe: context {command} needs --recipient <id>");
+        return ExitCode::from(2);
+    };
+    let message = option(args, "--message").unwrap_or_else(|| "Continue this Work.".into());
+    let mut request = ContextRequest::new(work_id, recipient_id, message);
+    if let Some(value) = option(args, "--max-items") {
+        request.max_items = match value.parse() {
+            Ok(value) => value,
+            Err(_) => return cli_value_error("--max-items must be a number"),
+        };
+    }
+    if let Some(value) = option(args, "--max-bytes") {
+        request.max_bytes = match value.parse() {
+            Ok(value) => value,
+            Err(_) => return cli_value_error("--max-bytes must be a number"),
+        };
+    }
+    if let Some(value) = option(args, "--max-reference-bytes") {
+        request.max_reference_bytes = match value.parse() {
+            Ok(value) => value,
+            Err(_) => return cli_value_error("--max-reference-bytes must be a number"),
+        };
+    }
+    if let Some(value) = option(args, "--max-content-bytes") {
+        request.max_content_bytes = match value.parse() {
+            Ok(value) => value,
+            Err(_) => return cli_value_error("--max-content-bytes must be a number"),
+        };
+    }
+    if let Some(value) = option(args, "--max-file-bytes") {
+        request.max_file_bytes = match value.parse() {
+            Ok(value) => value,
+            Err(_) => return cli_value_error("--max-file-bytes must be a number"),
+        };
+    }
+    let store = match FeltDbWorkStore::for_combe() {
+        Ok(store) => store,
+        Err(error) => return work_error(error),
+    };
+    let package = match ContextAssembler::assemble(&store, &request) {
+        Ok(package) => package,
+        Err(error) => return work_error(error),
+    };
+    let json = args.iter().any(|value| value == "--json");
+    if command == "fingerprint" {
+        println!("{}", package.fingerprint);
+        return ExitCode::SUCCESS;
+    }
+    if command == "diff" {
+        let Some(previous) = args.get(2).filter(|value| !value.starts_with("--")) else {
+            return cli_value_error("context diff needs a previous fingerprint");
+        };
+        let previous_items = store
+            .ai_conversation_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|conversation| store.ai_exchanges(&conversation).unwrap_or_default())
+            .find(|exchange| exchange.context_fingerprint == *previous)
+            .map(|exchange| exchange.context_items)
+            .unwrap_or_default();
+        let current_items = package
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        let added = current_items
+            .iter()
+            .filter(|item| !previous_items.contains(item))
+            .collect::<Vec<_>>();
+        let removed = previous_items
+            .iter()
+            .filter(|item| !current_items.contains(item))
+            .collect::<Vec<_>>();
+        let value = serde_json::json!({
+            "previous_fingerprint": previous,
+            "current_fingerprint": package.fingerprint,
+            "changed": previous != &package.fingerprint,
+            "added": added,
+            "removed": removed,
+            "current_items": current_items,
+            "previous_items": previous_items
+        });
+        return match graph_print(&value, json) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => work_error(error),
+        };
+    }
+    if json || command == "inspect" {
+        return match graph_print(&package, json) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => work_error(error),
+        };
+    }
+    println!(
+        "{} items · {} bytes{}\nworktree: {}\nprovider: {}{}\nfingerprint: {}",
+        package.items.len(),
+        package.bytes,
+        if package.truncated { " · bounded" } else { "" },
+        package.worktree,
+        package.provider,
+        package
+            .model
+            .as_deref()
+            .map(|model| format!(" · {model}"))
+            .unwrap_or_default(),
+        package.fingerprint
+    );
+    for item in package.items {
+        println!("\n{:?} · {}\n{}", item.kind, item.display, item.reference);
+        println!(
+            "  content: {:?}{}",
+            item.content_status,
+            item.byte_size
+                .map(|bytes| format!(" · {bytes} bytes"))
+                .unwrap_or_default()
+        );
+        for reason in item.reasons {
+            println!("  - {reason}");
+        }
+        if let Some(content) = item.content {
+            println!("\n--- exact provider content ---\n{content}\n--- end content ---");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn cli_value_error(message: &str) -> ExitCode {
+    eprintln!("combe: {message}");
+    ExitCode::from(2)
+}
+
+fn graph(args: &[String]) -> ExitCode {
+    let Some(command) = args.first().map(String::as_str) else {
+        eprintln!("combe: graph needs status, rebuild, verify, inspect, or related");
+        return ExitCode::from(2);
+    };
+    let store = match FeltDbWorkStore::for_combe() {
+        Ok(store) => store,
+        Err(error) => return work_error(error),
+    };
+    let json = args.iter().any(|value| value == "--json");
+    let result = match command {
+        "status" | "verify" => {
+            ContextGraphProjector::verify(&store).and_then(|health| graph_print(&health, json))
+        }
+        "rebuild" => graph_rebuild(&store, &args[1..], json),
+        "inspect" | "related" => graph_inspect(&store, &args[1..], command == "related", json),
+        other => {
+            eprintln!("combe: unknown graph command '{other}'");
+            return ExitCode::from(2);
+        }
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => work_error(error),
+    }
+}
+
+fn graph_rebuild(store: &FeltDbWorkStore, args: &[String], json: bool) -> combe_state::Result<()> {
+    let dry_run = args.iter().any(|value| value == "--dry-run");
+    let verify = args.iter().any(|value| value == "--verify");
+    let projection = ContextGraphProjector::build(store)?;
+    let scope = option(args, "--work")
+        .map(|id| format!("work:{id}"))
+        .or_else(|| option(args, "--worktree").map(|id| format!("worktree:{id}")));
+    if let Some(repository) = option(args, "--repository") {
+        let nodes = projection
+            .nodes
+            .iter()
+            .filter(|node| node.properties.get("repository_id") == Some(&repository))
+            .count();
+        return graph_print(
+            &serde_json::json!({
+                "dry_run": true,
+                "scope": { "repository": repository },
+                "nodes": nodes,
+                "graph_fingerprint": projection.graph_fingerprint
+            }),
+            json,
+        );
+    }
+    if let Some(root) = scope {
+        let subgraph = projection.traverse(&root, &GraphQueryOptions::default())?;
+        return graph_print(&subgraph, json);
+    }
+    if verify {
+        return graph_print(&ContextGraphProjector::verify(store)?, json);
+    }
+    if !dry_run {
+        store.save_context_graph(&projection)?;
+    }
+    graph_print(
+        &serde_json::json!({
+            "dry_run": dry_run,
+            "contract": projection.contract,
+            "version": projection.version,
+            "graph_fingerprint": projection.graph_fingerprint,
+            "source_revision": projection.source_revision,
+            "nodes": projection.nodes.len(),
+            "edges": projection.edges.len()
+        }),
+        json,
+    )
+}
+
+fn graph_inspect(
+    store: &FeltDbWorkStore,
+    args: &[String],
+    related: bool,
+    json: bool,
+) -> combe_state::Result<()> {
+    let requested = args.first().ok_or_else(|| {
+        combe_state::StateError::InvalidEntity("graph inspect needs a node identity".into())
+    })?;
+    let projection =
+        store
+            .load_context_graph()?
+            .ok_or_else(|| combe_state::StateError::NotFound {
+                entity_type: "context-graph".into(),
+                id: "v1".into(),
+            })?;
+    let id = projection
+        .nodes
+        .iter()
+        .find(|node| &node.id == requested)
+        .or_else(|| {
+            requested.strip_prefix("file:").and_then(|path| {
+                projection.nodes.iter().find(|node| {
+                    node.properties
+                        .get("path")
+                        .is_some_and(|value| value == path)
+                })
+            })
+        })
+        .map(|node| node.id.as_str())
+        .ok_or_else(|| combe_state::StateError::NotFound {
+            entity_type: "context-node".into(),
+            id: requested.clone(),
+        })?;
+    if related {
+        graph_print(
+            &projection.related(id, &GraphQueryOptions::default())?,
+            json,
+        )
+    } else {
+        let node = projection.nodes.iter().find(|node| node.id == id).unwrap();
+        graph_print(node, json)
+    }
+}
+
+fn graph_print(value: &impl serde::Serialize, json: bool) -> combe_state::Result<()> {
+    if json {
+        println!("{}", serde_json::to_string(value)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(value)?);
+    }
+    Ok(())
+}
+
+fn chatgpt_history(args: &[String]) -> ExitCode {
+    if args.first().map(String::as_str) != Some("import") {
+        eprintln!("combe: chatgpt needs 'import <export.zip>'");
+        return ExitCode::from(2);
+    }
+    let Some(path) = args.get(1) else {
+        eprintln!("combe: chatgpt import needs an export ZIP or conversation JSON file");
+        return ExitCode::from(2);
+    };
+    let acquisition = match crate::chatgpt_history::acquire(Path::new(path)) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("combe: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let parse_date = |name: &str| {
+        option(args, name)
+            .map(|value| chrono::NaiveDate::parse_from_str(&value, "%Y-%m-%d"))
+            .transpose()
+    };
+    let from = match parse_date("--from") {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("combe: --from must use YYYY-MM-DD");
+            return ExitCode::from(2);
+        }
+    };
+    let through = match parse_date("--to") {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("combe: --to must use YYYY-MM-DD");
+            return ExitCode::from(2);
+        }
+    };
+    let search = option(args, "--search").unwrap_or_default();
+    let requested_id = option(args, "--conversation");
+    let selected = acquisition
+        .conversations
+        .iter()
+        .filter(|conversation| {
+            let date = conversation
+                .updated_at
+                .or(conversation.created_at)
+                .map(|value| value.date_naive());
+            crate::chatgpt_history::matches(conversation, &search)
+                && requested_id
+                    .as_ref()
+                    .is_none_or(|id| &conversation.conversation_id == id)
+                && from.is_none_or(|from| date.is_some_and(|date| date >= from))
+                && through.is_none_or(|through| date.is_some_and(|date| date <= through))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let message_count = selected
+        .iter()
+        .map(|conversation| conversation.messages.len())
+        .sum::<usize>();
+    let dry_run = args.iter().any(|value| value == "--dry-run");
+    let json_output = args.iter().any(|value| value == "--json");
+    if dry_run {
+        if json_output {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "dry_run": true,
+                    "source": acquisition.source.display_name,
+                    "conversations_found": acquisition.conversations.len(),
+                    "conversations_selected": selected.len(),
+                    "messages_selected": message_count,
+                    "empty_conversations": acquisition.empty_count,
+                    "conversations_with_attachments": acquisition.attachment_count
+                })
+            );
+        } else {
+            println!("ChatGPT export: {}", acquisition.source.display_name);
+            println!("Conversations found: {}", acquisition.conversations.len());
+            println!("Conversations selected: {}", selected.len());
+            println!("Messages selected: {message_count}");
+            println!("Dry run: no state changed");
+        }
+        return ExitCode::SUCCESS;
+    }
+    if selected.is_empty() {
+        eprintln!("combe: no conversations match the selection");
+        return ExitCode::from(2);
+    }
+    let store = match FeltDbWorkStore::for_combe() {
+        Ok(store) => store,
+        Err(error) => return work_error(error),
+    };
+    match store.import_chatgpt_source(acquisition.source, selected) {
+        Ok(result) => {
+            if json_output {
+                println!("{}", serde_json::to_string(&result).unwrap());
+            } else {
+                println!("New conversations: {}", result.new_conversations);
+                println!("Updated conversations: {}", result.updated_conversations);
+                println!("New messages: {}", result.new_messages);
+                println!("Duplicates: {}", result.duplicate_conversations);
+                println!("Skipped: {}", result.skipped_conversations);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => work_error(error),
     }
 }
 
@@ -125,6 +523,11 @@ fn work(args: &[String]) -> ExitCode {
         "list" => work_list(&store, &args[1..]),
         "create" => work_create(&store, &args[1..]),
         "show" => work_show(&store, &args[1..]),
+        "activity" => work_activity(&store, &args[1..]),
+        "exchange" => work_exchange(&store, &args[1..], false),
+        "result" => work_exchange(&store, &args[1..], true),
+        "next" => work_attention(&store, &args[1..], true),
+        "attention" => work_attention(&store, &args[1..], false),
         "context" => work_context(&store, &args[1..]),
         "protocol" => work_protocol(&store, &args[1..]),
         "chatgpt" => work_chatgpt(&store, &args[1..]),
@@ -293,12 +696,14 @@ fn adapters() -> (
     OllamaAdapter,
     ClaudeCodeAdapter,
     ChatGptManualAdapter,
+    ChatGptProvider,
     OpenAiAdapter,
 ) {
     (
         OllamaAdapter::new(),
         ClaudeCodeAdapter,
         ChatGptManualAdapter,
+        ChatGptProvider::new(),
         OpenAiAdapter::new(),
     )
 }
@@ -309,11 +714,11 @@ fn test_provider(store: &FeltDbWorkStore, args: &[String]) -> combe_state::Resul
     })?;
     let profile = store.get_profile(&ProviderProfileId(id.clone()))?;
     let credentials = KeychainCredentialStore::new();
-    let (ollama, claude, chatgpt, openai) = adapters();
+    let (ollama, claude, chatgpt, chatgpt_api, openai) = adapters();
     let router = RoutingService::new(
         store,
         &credentials,
-        vec![&ollama, &claude, &chatgpt, &openai],
+        vec![&ollama, &claude, &chatgpt, &chatgpt_api, &openai],
     );
     let status = router
         .test_profile(&profile)
@@ -460,11 +865,11 @@ fn route(args: &[String]) -> ExitCode {
         Err(error) => return work_error(error),
     };
     let credentials = KeychainCredentialStore::new();
-    let (ollama, claude, chatgpt, openai) = adapters();
+    let (ollama, claude, chatgpt, chatgpt_api, openai) = adapters();
     let router = RoutingService::new(
         &store,
         &credentials,
-        vec![&ollama, &claude, &chatgpt, &openai],
+        vec![&ollama, &claude, &chatgpt, &chatgpt_api, &openai],
     );
     match router.send(&work_id, &recipient_id, &message) {
         Ok(result) => {
@@ -578,6 +983,348 @@ fn work_show(store: &impl WorkStore, args: &[String]) -> ExitCode {
         }
         Err(error) => work_error(error),
     }
+}
+
+fn work_activity(store: &FeltDbWorkStore, args: &[String]) -> ExitCode {
+    let Some(id) = parse_work_id(args) else {
+        eprintln!("combe: work activity needs a Work id");
+        return ExitCode::from(2);
+    };
+    let context = match store.context(&id) {
+        Ok(context) => context,
+        Err(error) => return work_error(error),
+    };
+    let exchanges = match store.ai_exchanges(&format!("work:{}", id.0)) {
+        Ok(exchanges) => exchanges,
+        Err(error) => return work_error(error),
+    };
+    let mut entries = Vec::new();
+    for proposal in &context.proposals {
+        entries.push((
+            proposal.created_at,
+            serde_json::json!({
+                "at": proposal.created_at,
+                "kind": "proposal.created",
+                "actor": participant_label(&context, &proposal.proposed_by.0),
+                "summary": proposal.title,
+                "proposal_id": proposal.id
+            }),
+        ));
+    }
+    for review in &context.reviews {
+        entries.push((
+            review.created_at,
+            serde_json::json!({
+                "at": review.created_at,
+                "kind": "proposal.reviewed",
+                "actor": participant_label(&context, &review.reviewed_by.0),
+                "summary": format!("{:?}", review.outcome),
+                "proposal_id": review.proposal_id
+            }),
+        ));
+    }
+    for assignment in &context.assignments {
+        entries.push((
+            assignment.created_at,
+            serde_json::json!({
+                "at": assignment.created_at,
+                "kind": "assignment.created",
+                "actor": participant_label(&context, &assignment.to_participant_id.0),
+                "summary": assignment.instruction,
+                "assignment_id": assignment.id
+            }),
+        ));
+    }
+    for execution in &context.executions {
+        entries.push((
+            execution.started_at,
+            serde_json::json!({
+                "at": execution.started_at,
+                "kind": "execution.started",
+                "actor": execution.provider,
+                "summary": format!("Execution {:?}", execution.status),
+                "execution_id": execution.id
+            }),
+        ));
+    }
+    for exchange in exchanges {
+        entries.push((exchange.created_at, serde_json::json!({
+            "at": exchange.created_at,
+            "kind": "provider.exchange",
+            "actor": exchange.provider,
+            "summary": format!("{:?} · {} context items", exchange.status, exchange.context_items.len()),
+            "exchange_id": exchange.id,
+            "recipient_id": exchange.recipient_id,
+            "provider_profile_id": exchange.provider_profile_id,
+            "context_fingerprint": exchange.context_fingerprint
+        })));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    let values = entries
+        .into_iter()
+        .map(|(_, value)| value)
+        .collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--json") {
+        return match serde_json::to_string_pretty(&values) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => work_error(error),
+        };
+    }
+    println!("{}\n", context.work.title);
+    for value in values {
+        println!(
+            "{}  {}\n  {}\n  {}",
+            value["at"].as_str().unwrap_or(""),
+            value["actor"].as_str().unwrap_or("Combe"),
+            value["summary"].as_str().unwrap_or(""),
+            value["kind"].as_str().unwrap_or("")
+        );
+        if let Some(exchange) = value["exchange_id"].as_str() {
+            println!("  exchange: {exchange}");
+        }
+        if let Some(fingerprint) = value["context_fingerprint"].as_str() {
+            println!("  context: {fingerprint}");
+        }
+        println!();
+    }
+    ExitCode::SUCCESS
+}
+
+fn work_attention(store: &FeltDbWorkStore, args: &[String], next_only: bool) -> ExitCode {
+    let json = args.iter().any(|arg| arg == "--json");
+    if args.iter().any(|arg| arg == "--all") {
+        if next_only {
+            return cli_value_error("work next needs one Work id");
+        }
+        let health = match ContextGraphProjector::verify(store) {
+            Ok(health) => health,
+            Err(error) => return work_error(error),
+        };
+        let mut works = match store.list_works(None) {
+            Ok(works) => works,
+            Err(error) => return work_error(error),
+        };
+        works.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+        let mut projections = Vec::new();
+        for work in works {
+            match derive_work_attention_with_health(store, &work.id, &health) {
+                Ok(attention) => projections.push(attention),
+                Err(error) => return work_error(error),
+            }
+        }
+        if json {
+            return match serde_json::to_string_pretty(&projections) {
+                Ok(value) => {
+                    println!("{value}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => work_error(error),
+            };
+        }
+        for attention in projections {
+            println!("{}  {} actions", attention.work_id, attention.items.len());
+            if let Some(item) = attention.items.first() {
+                println!("  {:?}: {}", item.priority, item.title);
+                println!("  {}", item.reason);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    let Some(id) = args.iter().find(|arg| !arg.starts_with("--")) else {
+        eprintln!(
+            "combe: work {} needs a Work id",
+            if next_only { "next" } else { "attention" }
+        );
+        return ExitCode::from(2);
+    };
+    let attention = match derive_work_attention(store, &WorkId(id.clone())) {
+        Ok(attention) => attention,
+        Err(error) => return work_error(error),
+    };
+    if json {
+        if next_only {
+            let value = serde_json::json!({
+                "work_id": attention.work_id,
+                "revision": attention.revision,
+                "item": attention.items.first()
+            });
+            return match serde_json::to_string_pretty(&value) {
+                Ok(value) => {
+                    println!("{value}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => work_error(error),
+            };
+        }
+        return match serde_json::to_string_pretty(&attention) {
+            Ok(value) => {
+                println!("{value}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => work_error(error),
+        };
+    }
+    if next_only {
+        if let Some(item) = attention.items.first() {
+            println!("{:?}  {}", item.priority, item.title);
+            println!("{}", item.reason);
+            if let Some(id) = &item.related_id {
+                println!("related: {id}");
+            }
+        } else {
+            println!("Nothing requires attention.");
+        }
+        return ExitCode::SUCCESS;
+    }
+    println!(
+        "{} · revision {} · {} actions",
+        attention.work_id,
+        attention.revision,
+        attention.items.len()
+    );
+    for item in attention.items {
+        println!("\n{:?}  {}", item.priority, item.title);
+        println!("{}", item.reason);
+        if let Some(id) = item.related_id {
+            println!("related: {id}");
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn participant_label(context: &combe_state::WorkContext, id: &str) -> String {
+    context
+        .participants
+        .iter()
+        .find(|participant| participant.id.0 == id)
+        .map(|participant| participant.name.clone())
+        .unwrap_or_else(|| id.into())
+}
+
+fn work_exchange(store: &FeltDbWorkStore, args: &[String], result_only: bool) -> ExitCode {
+    let Some(id) = args.first() else {
+        eprintln!(
+            "combe: work {} needs an exchange id",
+            if result_only { "result" } else { "exchange" }
+        );
+        return ExitCode::from(2);
+    };
+    let exchange = match find_exchange(store, id) {
+        Ok(exchange) => exchange,
+        Err(error) => return work_error(error),
+    };
+    let events = match store.ai_events(&exchange.conversation_id) {
+        Ok(events) => events,
+        Err(error) => return work_error(error),
+    };
+    let request = ai_message_content(&events, &exchange.input_message_id).unwrap_or_default();
+    let response = ai_message_content(&events, &exchange.output_message_id).unwrap_or_default();
+    let recipient = exchange
+        .recipient_id
+        .as_ref()
+        .and_then(|id| store.get_recipient(id).ok())
+        .map(|recipient| recipient.name);
+    let profile = exchange
+        .provider_profile_id
+        .as_ref()
+        .and_then(|id| store.get_profile(id).ok())
+        .map(|profile| profile.name);
+    let artifacts = exchange
+        .work_id
+        .as_ref()
+        .and_then(|id| store.context(id).ok())
+        .map(|context| context.artifacts)
+        .unwrap_or_default();
+    let value = serde_json::json!({
+        "id": exchange.id,
+        "status": exchange.status,
+        "work_id": exchange.work_id,
+        "conversation_id": exchange.conversation_id,
+        "recipient": recipient,
+        "recipient_id": exchange.recipient_id,
+        "provider": exchange.provider,
+        "provider_profile": profile,
+        "provider_profile_id": exchange.provider_profile_id,
+        "service": exchange.service,
+        "model": exchange.model,
+        "execution_mode": exchange.execution_mode,
+        "context_fingerprint": exchange.context_fingerprint,
+        "context_items": exchange.context_items,
+        "context_item_count": exchange.context_items.len(),
+        "context_bytes": exchange.context_bytes,
+        "request": request,
+        "response": response,
+        "request_id": exchange.request_id,
+        "usage": exchange.usage,
+        "duration_ms": exchange.duration_ms,
+        "error": exchange.error,
+        "artifacts": artifacts,
+        "created_at": exchange.created_at
+    });
+    if args.iter().any(|arg| arg == "--json") {
+        return match serde_json::to_string_pretty(&value) {
+            Ok(json) => {
+                println!("{json}");
+                ExitCode::SUCCESS
+            }
+            Err(error) => work_error(error),
+        };
+    }
+    if result_only {
+        println!("status: {:?}", exchange.status);
+        if let Some(error) = &exchange.error {
+            println!("error: {error}");
+        }
+        println!("{response}");
+        return ExitCode::SUCCESS;
+    }
+    println!("exchange: {}", exchange.id);
+    println!("status: {:?}", exchange.status);
+    println!("recipient: {}", recipient.as_deref().unwrap_or("-"));
+    println!(
+        "provider: {} / {}",
+        exchange.provider,
+        profile.as_deref().unwrap_or("-")
+    );
+    println!("model: {}", exchange.model.as_deref().unwrap_or("-"));
+    println!("execution: {:?}", exchange.execution_mode);
+    println!("context: {}", exchange.context_fingerprint);
+    println!("context items: {}", exchange.context_items.len());
+    println!("context bytes: {}", exchange.context_bytes);
+    println!("duration: {} ms", exchange.duration_ms.unwrap_or(0));
+    println!("\nREQUEST\n{request}\n\nRESPONSE\n{response}");
+    if let Some(error) = exchange.error {
+        println!("\nERROR\n{error}");
+    }
+    ExitCode::SUCCESS
+}
+
+fn find_exchange(store: &FeltDbWorkStore, id: &str) -> combe_state::Result<AiProviderExchange> {
+    for conversation in store.ai_conversation_ids()? {
+        if let Some(exchange) = store
+            .ai_exchanges(&conversation)?
+            .into_iter()
+            .find(|exchange| exchange.id == id)
+        {
+            return Ok(exchange);
+        }
+    }
+    Err(combe_state::StateError::NotFound {
+        entity_type: "provider exchange".into(),
+        id: id.into(),
+    })
+}
+
+fn ai_message_content(events: &[combe_state::AiContextEvent], id: &str) -> Option<String> {
+    events.iter().find_map(|event| match &event.event {
+        AiContextEventData::MessageCreated { message } if message.id == id => {
+            Some(message.content.clone())
+        }
+        _ => None,
+    })
 }
 
 fn work_context(store: &impl WorkStore, args: &[String]) -> ExitCode {

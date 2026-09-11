@@ -100,6 +100,7 @@ pub struct WorkMessage {
 pub enum ProviderResultStatus {
     Completed,
     ManualTransferRequired,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -138,13 +139,16 @@ impl ProviderProfile {
                 "provider profile name cannot be empty".into(),
             ));
         }
-        let expected = match self.service {
-            ProviderService::Ollama => ExecutionMode::LocalHttp,
-            ProviderService::ClaudeCode => ExecutionMode::LocalCli,
-            ProviderService::ChatGpt => ExecutionMode::ExternalManual,
-            ProviderService::OpenAiApi => ExecutionMode::HttpApi,
+        let valid_mode = match self.service {
+            ProviderService::Ollama => self.execution_mode == ExecutionMode::LocalHttp,
+            ProviderService::ClaudeCode => self.execution_mode == ExecutionMode::LocalCli,
+            ProviderService::ChatGpt => matches!(
+                self.execution_mode,
+                ExecutionMode::ExternalManual | ExecutionMode::HttpApi
+            ),
+            ProviderService::OpenAiApi => self.execution_mode == ExecutionMode::HttpApi,
         };
-        if self.execution_mode != expected {
+        if !valid_mode {
             return Err(crate::StateError::InvalidEntity(
                 "execution mode does not match provider service".into(),
             ));
@@ -153,6 +157,9 @@ impl ProviderProfile {
             self.service,
             ProviderService::Ollama | ProviderService::OpenAiApi
         ) && self.model.as_deref().is_none_or(str::is_empty)
+            || self.service == ProviderService::ChatGpt
+                && self.execution_mode == ExecutionMode::HttpApi
+                && self.model.as_deref().is_none_or(str::is_empty)
         {
             return Err(crate::StateError::InvalidEntity(
                 "provider profile requires an explicit model".into(),

@@ -368,6 +368,21 @@ pub struct WorkArtifact {
     pub created_at: Timestamp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextFileDisposition {
+    Include,
+    Exclude,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkContextFileHint {
+    pub work_id: WorkId,
+    pub path: String,
+    pub disposition: ContextFileDisposition,
+    pub updated_at: Timestamp,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkContext {
     #[serde(default = "protocol_version")]

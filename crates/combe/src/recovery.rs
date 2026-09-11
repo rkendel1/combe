@@ -1,4 +1,4 @@
-use combe_state::{FileWorkspaceStore, Tab, Workspace, WorkspaceState, WorkspaceStore, Result};
+use combe_state::{FileWorkspaceStore, Result, Tab, Workspace, WorkspaceState, WorkspaceStore};
 use std::path::Path;
 
 pub struct SessionRecovery;
@@ -84,10 +84,7 @@ mod tests {
 
     #[test]
     fn test_validate_pane_cwd_missing_directory() {
-        let result = SessionRecovery::validate_pane_cwd(
-            "/nonexistent/path",
-            "/fallback/workspace",
-        );
+        let result = SessionRecovery::validate_pane_cwd("/nonexistent/path", "/fallback/workspace");
         assert_eq!(result, "/fallback/workspace");
     }
 

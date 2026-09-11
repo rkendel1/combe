@@ -16,6 +16,7 @@ pub const CHROME_STRONG: (u32, u32) = (0x292d33ff, 0xe6e7e9ff);
 pub const CHROME_MUTED: (u32, u32) = (0x656970ff, 0x9c9ea3ff);
 pub const CHROME_SOFT: (u32, u32) = (0x555960ff, 0xc3c4c7ff);
 pub const CHROME_SELECTION: (u32, u32) = (0x00000008, 0xffffff12);
+pub const CHROME_ACTION: (u32, u32) = (0x00000006, 0xffffff0a);
 pub const CHROME_HINT: (u32, u32) = (0x00000006, 0xffffff0d);
 pub const CHROME_SESSION: (u32, u32) = (0x248247ff, 0x65c888ff);
 pub const CHROME_SESSION_IDLE: (u32, u32) = (0x85878dff, 0x85878dff);

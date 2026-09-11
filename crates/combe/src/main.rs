@@ -1,6 +1,8 @@
 mod chatgpt_adapter;
+mod chatgpt_history;
 mod chrome_view;
 mod cli;
+mod conversation_runtime;
 mod credential_store;
 mod find_bar;
 mod ghostty;
@@ -18,6 +20,7 @@ mod surface;
 mod tabs;
 mod window;
 mod work_overview;
+mod worktree_inspector;
 
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
 use objc2_foundation::MainThreadMarker;

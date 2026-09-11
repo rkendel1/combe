@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ffi::c_void;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use chrono::Utc;
@@ -13,28 +14,31 @@ use objc2_app_kit::{
     NSAnimatablePropertyContainer, NSAnimationContext, NSAppearance, NSAppearanceCustomization,
     NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication, NSApplicationDelegate,
     NSApplicationTerminateReply, NSAutoresizingMaskOptions, NSBackingStoreType, NSBezierPath,
-    NSButton, NSColor, NSComboBox, NSEvent, NSEventModifierFlags, NSEventType, NSFont, NSImage,
-    NSImageView, NSMenu, NSMenuItem, NSMenuWillSendActionNotification, NSOpenPanel, NSResponder,
-    NSScrollView, NSSecureTextField, NSShadow, NSSplitView, NSSplitViewDelegate,
-    NSSplitViewDividerStyle, NSText, NSTextField, NSUserInterfaceItemIdentification, NSView,
-    NSViewLayerContentsRedrawPolicy, NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask,
-    NSWindowTitleVisibility, NSWorkspace,
+    NSButton, NSColor, NSComboBox, NSControlStateValueOn, NSEvent, NSEventModifierFlags,
+    NSEventType, NSFont, NSImage, NSImageView, NSMenu, NSMenuItem, NSFontAttributeName,
+    NSForegroundColorAttributeName,
+    NSMenuWillSendActionNotification, NSOpenPanel, NSPopUpButton, NSResponder, NSScrollView,
+    NSSecureTextField, NSShadow, NSSplitView, NSSplitViewDelegate, NSSplitViewDividerStyle, NSText,
+    NSTextField, NSUserInterfaceItemIdentification, NSView, NSViewLayerContentsRedrawPolicy,
+    NSWindow, NSWindowButton, NSWindowDelegate, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSWorkspace,
 };
 use objc2_core_foundation::CGFloat;
 use objc2_foundation::{
-    MainThreadMarker, NSArray, NSInteger, NSNotification, NSNotificationCenter, NSPoint, NSRect,
-    NSSize, NSString, NSTimer,
+    MainThreadMarker, NSArray, NSInteger, NSMutableAttributedString, NSNotification,
+    NSNotificationCenter, NSPoint, NSRange, NSRect, NSSize, NSString, NSTimer,
 };
 use objc2_quartz_core::CAMediaTimingFunction;
 
 use crate::chrome_view::{self, ClickView};
+use crate::conversation_runtime::{ConversationResponseEvent, ConversationRuntime};
 use crate::credential_store::{Credential, CredentialStore, KeychainCredentialStore};
 use crate::ghostty;
 use crate::habits;
 use crate::overview::Overview;
 use crate::provider_router::{
-    ChatGptManualAdapter, ClaudeCodeAdapter, MessageRouter, OllamaAdapter, OpenAiAdapter,
-    RoutingService,
+    ChatGptManualAdapter, ChatGptProvider, ClaudeCodeAdapter, MessageRouter, OllamaAdapter,
+    OpenAiAdapter, RoutingService,
 };
 use crate::quota_panel;
 use crate::sidebar;
@@ -43,12 +47,15 @@ use crate::surface::SurfaceView;
 use crate::tabs::Tabs;
 use crate::work_overview;
 use combe_state::{
-    AssignmentId, AssignmentStatus, ConversationProvider, CredentialRef, ExecutionMode,
-    ExecutionStatus, FeltDbWorkStore, FeltDbWorkspaceStore, Participant, ParticipantKind,
-    ProposalId, ProposalReview, ProposalStatus, ProviderCapabilities, ProviderProfile,
-    ProviderProfileId, ProviderRegistry, ProviderService, Recipient, RecipientId, ReviewId,
-    ReviewOutcome, TurnOrigin, Work, WorkAssignment, WorkContext, WorkId, WorkProposal, WorkStore,
-    WorkspaceStore,
+    AiContinuityStore, AssignmentId, AssignmentStatus, ChatGptHistoryConversation,
+    ChatGptHistoryStore, ContextGraphProjector, ConversationId, ConversationProvider,
+    ConversationRef, CredentialRef, ExecutionMode, ExecutionStatus, FeltDbWorkStore,
+    FeltDbWorkspaceStore, Participant, ParticipantKind, ProposalId, ProposalReview, ProposalStatus,
+    ProviderCapabilities, ProviderProfile, ProviderProfileId, ProviderRegistry, ProviderService,
+    Recipient, RecipientId, ResolveConversationOptions, ReviewId, ReviewOutcome, TurnId, TurnKind,
+    TurnOrigin, Work, WorkAssignment, WorkContext, WorkConversation, WorkId, WorkProposal,
+    WorkStore, WorkTurn, WorkspaceStore, derive_work_attention_with_health,
+    resolve_conversation_context,
 };
 
 const ROW_HEIGHT: f64 = 36.0;
@@ -106,7 +113,12 @@ struct State {
     tab_scroller: Retained<NSScrollView>,
     content: Retained<NSView>,
     work_overview: Option<Retained<NSScrollView>>,
+    worktree_inspector: Option<Retained<NSScrollView>>,
+    inspector_root: Option<PathBuf>,
+    inspector_file: Option<PathBuf>,
+    expanded_directories: HashSet<PathBuf>,
     selected_work: Option<WorkId>,
+    selected_recipient: Option<RecipientId>,
     tabs: Tabs,
     repos: Vec<sidebar::Repo>,
     collapsed_repos: HashSet<PathBuf>,
@@ -280,6 +292,31 @@ define_class!(
         #[unsafe(method(configureRecipients:))]
         fn configure_recipients(&self, _sender: Option<&AnyObject>) {
             configure_recipients();
+        }
+
+        #[unsafe(method(newConversation:))]
+        fn new_conversation(&self, _sender: Option<&AnyObject>) {
+            new_conversation();
+        }
+
+        #[unsafe(method(continueConversation:))]
+        fn continue_conversation(&self, _sender: Option<&AnyObject>) {
+            choose_conversation();
+        }
+
+        #[unsafe(method(importChatGptHistory:))]
+        fn import_chatgpt_history(&self, _sender: Option<&AnyObject>) {
+            import_chatgpt_history();
+        }
+
+        #[unsafe(method(manageChatGptHistory:))]
+        fn manage_chatgpt_history(&self, _sender: Option<&AnyObject>) {
+            manage_chatgpt_history();
+        }
+
+        #[unsafe(method(attachChatGptHistory:))]
+        fn attach_chatgpt_history(&self, _sender: Option<&AnyObject>) {
+            attach_chatgpt_history();
         }
 
         #[unsafe(method(copyText:))]
@@ -607,6 +644,58 @@ pub fn install_menu(mtm: MainThreadMarker, app: &NSApplication) {
     ));
     work_item.setSubmenu(Some(&work_menu));
 
+    let conversation_item = NSMenuItem::new(mtm);
+    menubar.addItem(&conversation_item);
+    let conversation_menu = NSMenu::new(mtm);
+    conversation_menu.setTitle(&NSString::from_str("Conversation"));
+    conversation_menu.addItem(&item(
+        mtm,
+        "New Conversation…",
+        sel!(newConversation:),
+        Some(&commands),
+        "",
+        NSEventModifierFlags::empty(),
+    ));
+    conversation_menu.addItem(&item(
+        mtm,
+        "Continue Conversation…",
+        sel!(continueConversation:),
+        Some(&commands),
+        "",
+        NSEventModifierFlags::empty(),
+    ));
+    conversation_item.setSubmenu(Some(&conversation_menu));
+
+    let import_item = NSMenuItem::new(mtm);
+    menubar.addItem(&import_item);
+    let import_menu = NSMenu::new(mtm);
+    import_menu.setTitle(&NSString::from_str("Import"));
+    import_menu.addItem(&item(
+        mtm,
+        "ChatGPT History…",
+        sel!(importChatGptHistory:),
+        Some(&commands),
+        "",
+        NSEventModifierFlags::empty(),
+    ));
+    import_menu.addItem(&item(
+        mtm,
+        "Attach ChatGPT History to Work…",
+        sel!(attachChatGptHistory:),
+        Some(&commands),
+        "",
+        NSEventModifierFlags::empty(),
+    ));
+    import_menu.addItem(&item(
+        mtm,
+        "Manage Imported ChatGPT History…",
+        sel!(manageChatGptHistory:),
+        Some(&commands),
+        "",
+        NSEventModifierFlags::empty(),
+    ));
+    import_item.setSubmenu(Some(&import_menu));
+
     let view_item = NSMenuItem::new(mtm);
     menubar.addItem(&view_item);
     let view_menu = NSMenu::new(mtm);
@@ -907,7 +996,12 @@ pub fn open(mtm: MainThreadMarker) {
             tab_scroller,
             content: content.clone(),
             work_overview: None,
+            worktree_inspector: None,
+            inspector_root: None,
+            inspector_file: None,
+            expanded_directories: HashSet::new(),
             selected_work: None,
+            selected_recipient: None,
             tabs: Tabs::default(),
             repos: Vec::new(),
             collapsed_repos: HashSet::new(),
@@ -980,9 +1074,11 @@ fn first_row() -> Option<(String, String)> {
 fn dispatch(click: Click) {
     dismiss_overview(false);
     dismiss_work_overview();
+    dismiss_worktree_inspector();
     match click {
         Click::Open(path, label) => {
             open_worktree(&path, &label);
+            open_worktree_inspector(Path::new(&path));
             STATE.with(|state| {
                 let state = state.borrow();
                 let Some(state) = state.as_ref() else { return };
@@ -1050,13 +1146,14 @@ fn dismiss_work_overview() {
 }
 
 fn open_work_overview(id: &WorkId) {
+    dismiss_worktree_inspector();
     let Ok(store) = FeltDbWorkStore::for_combe() else {
         return;
     };
     let Ok(context) = store.context(id) else {
         return;
     };
-    let routes = store
+    let mut routes = store
         .list_recipients()
         .unwrap_or_default()
         .into_iter()
@@ -1075,6 +1172,14 @@ fn open_work_overview(id: &WorkId) {
             })
         })
         .collect::<Vec<_>>();
+    let selected_recipient = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .and_then(|state| state.selected_recipient.clone())
+    });
+    routes
+        .sort_by_key(|route| usize::from(Some(&route.recipient_id) != selected_recipient.as_ref()));
     let workspace = FeltDbWorkspaceStore::for_combe()
         .ok()
         .and_then(|store| {
@@ -1116,13 +1221,23 @@ fn open_work_overview(id: &WorkId) {
         let chatgpt_import_id = id.clone();
         let open_terminal_id = id.clone();
         let send_id = id.clone();
+        let preview_id = id.clone();
+        let retry_id = id.clone();
+        let copy_response_id = id.clone();
+        let propose_response_id = id.clone();
         let rendered_revision = context.revision;
         let actions = work_overview::Actions {
             send: Box::new(move |recipient, message| {
                 send_routed_message(&send_id, &recipient, &message)
             }),
+            preview: Box::new(move |recipient, message| {
+                preview_routed_context(&preview_id, &recipient, &message)
+            }),
+            retry: Box::new(move |recipient| retry_routed_message(&retry_id, &recipient)),
+            copy_response: Box::new(move || copy_work_response(&copy_response_id)),
+            propose_response: Box::new(move || propose_work_response(&propose_response_id)),
             configure_recipients: Box::new(configure_recipients),
-            new_proposal: Box::new(move || new_work_proposal(&new_proposal_id)),
+            new_proposal: Box::new(move || new_work_proposal(&new_proposal_id, None)),
             review: Box::new(move || review_work(&review_id)),
             request_changes: Box::new(move || {
                 proposal_action(&request_changes_id, "request-changes", rendered_revision)
@@ -1284,7 +1399,7 @@ fn chatgpt_import(id: &WorkId) {
     ));
 }
 
-fn new_work_proposal(id: &WorkId) {
+fn new_work_proposal(id: &WorkId, suggested_statement: Option<&str>) {
     let mtm = MainThreadMarker::new().expect("main thread");
     let alert = NSAlert::new(mtm);
     alert.setMessageText(&NSString::from_str("Create Proposal"));
@@ -1302,7 +1417,10 @@ fn new_work_proposal(id: &WorkId) {
     ));
     title.setPlaceholderString(Some(&NSString::from_str("Proposal title")));
     fields.addSubview(&title);
-    let statement = NSTextField::textFieldWithString(&NSString::from_str(""), mtm);
+    let statement = NSTextField::textFieldWithString(
+        &NSString::from_str(suggested_statement.unwrap_or("")),
+        mtm,
+    );
     statement.setFrame(NSRect::new(
         NSPoint::new(0.0, 4.0),
         NSSize::new(360.0, 48.0),
@@ -1348,17 +1466,23 @@ fn send_routed_message(id: &WorkId, recipient: &combe_state::RecipientId, messag
         show_work_error("Enter a message before continuing.");
         return;
     }
+    STATE.with(|state| {
+        if let Some(state) = state.borrow_mut().as_mut() {
+            state.selected_recipient = Some(recipient.clone());
+        }
+    });
     let result = (|| {
         let store = FeltDbWorkStore::for_combe()?;
         let credentials = KeychainCredentialStore::new();
         let ollama = OllamaAdapter::new();
         let claude = ClaudeCodeAdapter;
         let chatgpt = ChatGptManualAdapter;
+        let chatgpt_api = ChatGptProvider::new();
         let openai = OpenAiAdapter::new();
         let router = RoutingService::new(
             &store,
             &credentials,
-            vec![&ollama, &claude, &chatgpt, &openai],
+            vec![&ollama, &claude, &chatgpt, &chatgpt_api, &openai],
         );
         router
             .send(id, recipient, message)
@@ -1366,21 +1490,6 @@ fn send_routed_message(id: &WorkId, recipient: &combe_state::RecipientId, messag
     })();
     match result {
         Ok(result) => {
-            let mtm = MainThreadMarker::new().expect("main thread");
-            let alert = NSAlert::new(mtm);
-            match result.status {
-                combe_state::ProviderResultStatus::Completed => {
-                    alert.setMessageText(&NSString::from_str("Recipient responded"));
-                    alert.setInformativeText(&NSString::from_str(&result.content));
-                }
-                combe_state::ProviderResultStatus::ManualTransferRequired => {
-                    alert.setMessageText(&NSString::from_str("Manual transfer required"));
-                    alert.setInformativeText(&NSString::from_str(
-                        "This recipient is an external ChatGPT conversation. Combe will prepare its provider-neutral Work context in the workspace terminal; copy it into ChatGPT and import the response afterward.",
-                    ));
-                }
-            }
-            alert.runModal();
             if result.status == combe_state::ProviderResultStatus::ManualTransferRequired {
                 chatgpt_context(id, "inspect");
             }
@@ -1388,6 +1497,456 @@ fn send_routed_message(id: &WorkId, recipient: &combe_state::RecipientId, messag
             open_work_overview(id);
         }
         Err(error) => show_work_error(&error.to_string()),
+    }
+}
+
+fn preview_routed_context(id: &WorkId, recipient: &RecipientId, message: &str) {
+    if message.trim().is_empty() {
+        show_work_error("Enter the message you want to inspect context for.");
+        return;
+    }
+    let result = (|| {
+        let store = FeltDbWorkStore::for_combe()?;
+        let credentials = KeychainCredentialStore::new();
+        let ollama = OllamaAdapter::new();
+        let claude = ClaudeCodeAdapter;
+        let chatgpt = ChatGptManualAdapter;
+        let chatgpt_api = ChatGptProvider::new();
+        let openai = OpenAiAdapter::new();
+        let router = RoutingService::new(
+            &store,
+            &credentials,
+            vec![&ollama, &claude, &chatgpt, &chatgpt_api, &openai],
+        );
+        router
+            .preview_context(id, recipient, message)
+            .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))
+    })();
+    let package = match result {
+        Ok(package) => package,
+        Err(error) => {
+            show_work_error(&error.to_string());
+            return;
+        }
+    };
+    let mut body = format!(
+        "Recipient: {}\nProvider: {}{}\nWorktree: {}\nItems: {} · {} bytes{}\nFingerprint: {}\n",
+        package.recipient_id,
+        package.provider,
+        package
+            .model
+            .as_deref()
+            .map(|model| format!(" · {model}"))
+            .unwrap_or_default(),
+        package.worktree,
+        package.items.len(),
+        package.bytes,
+        if package.truncated { " · bounded" } else { "" },
+        package.fingerprint
+    );
+    for item in &package.items {
+        let content_detail = match item.content_status {
+            combe_state::ContextContentStatus::Included => format!(
+                "✓ Included · {} bytes · {}",
+                item.byte_size.unwrap_or_default(),
+                item.content_hash.as_deref().unwrap_or("no hash")
+            ),
+            combe_state::ContextContentStatus::ReferenceOnly => "○ Reference only".into(),
+            combe_state::ContextContentStatus::Excluded => "× Excluded".into(),
+            combe_state::ContextContentStatus::Unavailable => "× Unavailable".into(),
+            combe_state::ContextContentStatus::NotApplicable => String::new(),
+        };
+        body.push_str(&format!(
+            "\n{:?} · {}\n{}\n{}\n",
+            item.kind, item.display, item.reference, content_detail
+        ));
+        for reason in &item.reasons {
+            body.push_str(&format!("  • {reason}\n"));
+        }
+        if let Some(content) = &item.content {
+            body.push_str("\n--- exact provider content ---\n");
+            body.push_str(content);
+            body.push_str("\n--- end content ---\n");
+        }
+    }
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Context Preview"));
+    alert.setInformativeText(&NSString::from_str(
+        "This exact bounded package will be assembled again at Send. A changed fingerprint means the Work or graph changed.",
+    ));
+    let scroll = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(520.0, 360.0)),
+    );
+    scroll.setHasVerticalScroller(true);
+    let text = NSTextField::wrappingLabelWithString(&NSString::from_str(&body), mtm);
+    text.setFrame(NSRect::new(
+        NSPoint::new(8.0, 8.0),
+        NSSize::new(500.0, (body.lines().count() as f64 * 17.0).max(344.0)),
+    ));
+    scroll.setDocumentView(Some(&text));
+    alert.setAccessoryView(Some(&scroll));
+    let files = package
+        .items
+        .iter()
+        .filter(|item| item.kind == combe_state::ContextNodeKind::File)
+        .map(|item| item.reference.clone())
+        .filter(|reference| !reference.starts_with('['))
+        .collect::<Vec<_>>();
+    if !files.is_empty() {
+        alert.addButtonWithTitle(&NSString::from_str("Open File…"));
+    }
+    alert.addButtonWithTitle(&NSString::from_str("Done"));
+    let response = alert.runModal();
+    if !files.is_empty() && response == NSAlertFirstButtonReturn {
+        open_context_file(Path::new(&package.worktree), &files);
+    }
+}
+
+fn open_context_file(root: &Path, files: &[String]) {
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Open Context File"));
+    let picker = NSPopUpButton::initWithFrame_pullsDown(
+        NSPopUpButton::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 26.0)),
+        false,
+    );
+    for file in files {
+        picker.addItemWithTitle(&NSString::from_str(file));
+    }
+    alert.setAccessoryView(Some(&picker));
+    alert.addButtonWithTitle(&NSString::from_str("Open"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    if alert.runModal() != NSAlertFirstButtonReturn {
+        return;
+    }
+    let Ok(index) = usize::try_from(picker.indexOfSelectedItem()) else { return };
+    let Some(file) = files.get(index) else { return };
+    dismiss_work_overview();
+    open_worktree_inspector(root);
+    select_inspector_file(Path::new(file));
+}
+
+fn retry_routed_message(id: &WorkId, recipient: &RecipientId) {
+    match work_overview::latest_user_message(&id.0) {
+        Some(message) => send_routed_message(id, recipient, &message),
+        None => show_work_error("There is no message to retry."),
+    }
+}
+
+fn copy_work_response(id: &WorkId) {
+    let Some(response) = work_overview::latest_response(&id.0) else {
+        return;
+    };
+    copy_to_pasteboard(&response);
+}
+
+fn copy_to_pasteboard(value: &str) {
+    let Ok(mut process) = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return;
+    };
+    if let Some(mut input) = process.stdin.take() {
+        let _ = input.write_all(value.as_bytes());
+    }
+    let _ = process.wait();
+}
+
+fn propose_work_response(id: &WorkId) {
+    let Some(response) = work_overview::latest_response(&id.0) else {
+        return;
+    };
+    new_work_proposal(id, Some(&response));
+}
+
+fn native_conversation_routes(store: &FeltDbWorkStore) -> Vec<(Recipient, ProviderProfile)> {
+    store
+        .list_recipients()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|recipient| {
+            let profile = store.get_profile(&recipient.provider_profile_id).ok()?;
+            (recipient.enabled
+                && profile.enabled
+                && profile.capabilities.text_generation
+                && profile.execution_mode != ExecutionMode::ExternalManual)
+                .then_some((recipient, profile))
+        })
+        .collect()
+}
+
+fn new_conversation() {
+    let Ok(store) = FeltDbWorkStore::for_combe() else {
+        show_work_error("Combe conversation state is unavailable.");
+        return;
+    };
+    let routes = native_conversation_routes(&store);
+    if routes.is_empty() {
+        show_work_message(
+            "New Conversation",
+            "Configure a direct provider recipient first. ChatGPT API uses an OpenAI API key stored only in Keychain.",
+        );
+        configure_recipients();
+        return;
+    }
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("New Conversation"));
+    alert.setInformativeText(&NSString::from_str(
+        "Combe owns the conversation and messages. The selected provider and model can change later.",
+    ));
+    let fields = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 66.0)),
+    );
+    let title = form_field(mtm, &fields, 36.0, "Conversation objective or topic");
+    let picker = NSPopUpButton::initWithFrame_pullsDown(
+        NSPopUpButton::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 2.0), NSSize::new(420.0, 26.0)),
+        false,
+    );
+    for (recipient, profile) in &routes {
+        picker.addItemWithTitle(&NSString::from_str(&format!(
+            "{} — {:?} / {}",
+            recipient.name,
+            profile.service,
+            profile.model.as_deref().unwrap_or("no model")
+        )));
+    }
+    fields.addSubview(&picker);
+    alert.setAccessoryView(Some(&fields));
+    alert.addButtonWithTitle(&NSString::from_str("Create"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    if alert.runModal() != NSAlertFirstButtonReturn {
+        return;
+    }
+    let Ok(index) = usize::try_from(picker.indexOfSelectedItem()) else {
+        return;
+    };
+    let Some((recipient, _)) = routes.get(index) else {
+        return;
+    };
+    let work_id = STATE.with(|state| state.borrow().as_ref()?.selected_work.clone());
+    let credentials = KeychainCredentialStore::new();
+    let ollama = OllamaAdapter::new();
+    let claude = ClaudeCodeAdapter;
+    let chatgpt = ChatGptManualAdapter;
+    let chatgpt_api = ChatGptProvider::new();
+    let openai = OpenAiAdapter::new();
+    let runtime = ConversationRuntime::new(
+        &store,
+        &credentials,
+        vec![&ollama, &claude, &chatgpt, &chatgpt_api, &openai],
+    );
+    match runtime.create(
+        &recipient.id,
+        &title.stringValue().to_string(),
+        work_id.as_ref(),
+    ) {
+        Ok(conversation_id) => conversation_loop(&conversation_id),
+        Err(error) => show_work_error(&error.to_string()),
+    }
+}
+
+fn choose_conversation() {
+    let Ok(store) = FeltDbWorkStore::for_combe() else {
+        return;
+    };
+    let conversations = store
+        .ai_conversation_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| !id.starts_with("chatgpt:") && !id.starts_with("work:"))
+        .filter_map(|id| {
+            let context =
+                resolve_conversation_context(&store, &id, ResolveConversationOptions::default())
+                    .ok()?;
+            Some((id, context.summary))
+        })
+        .collect::<Vec<_>>();
+    if conversations.is_empty() {
+        new_conversation();
+        return;
+    }
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Continue Conversation"));
+    let picker = NSPopUpButton::initWithFrame_pullsDown(
+        NSPopUpButton::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(420.0, 28.0)),
+        false,
+    );
+    for (_, summary) in &conversations {
+        picker.addItemWithTitle(&NSString::from_str(if summary.is_empty() {
+            "Untitled conversation"
+        } else {
+            summary
+        }));
+    }
+    alert.setAccessoryView(Some(&picker));
+    alert.addButtonWithTitle(&NSString::from_str("Continue"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    if alert.runModal() == NSAlertFirstButtonReturn
+        && let Ok(index) = usize::try_from(picker.indexOfSelectedItem())
+        && let Some((id, _)) = conversations.get(index)
+    {
+        conversation_loop(id);
+    }
+}
+
+fn conversation_loop(conversation_id: &str) {
+    loop {
+        let Ok(store) = FeltDbWorkStore::for_combe() else {
+            return;
+        };
+        let routes = native_conversation_routes(&store);
+        if routes.is_empty() {
+            show_work_error("No direct provider recipient is configured.");
+            return;
+        }
+        let Ok(context) = resolve_conversation_context(
+            &store,
+            conversation_id,
+            ResolveConversationOptions::default(),
+        ) else {
+            return;
+        };
+        let transcript = context
+            .recent_messages
+            .iter()
+            .map(|message| {
+                let speaker = if message.role == "user" {
+                    "You"
+                } else {
+                    "Assistant"
+                };
+                format!("{speaker}:\n{}", message.content)
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mtm = MainThreadMarker::new().expect("main thread");
+        let alert = NSAlert::new(mtm);
+        alert.setMessageText(&NSString::from_str(if context.summary.is_empty() {
+            "Conversation"
+        } else {
+            &context.summary
+        }));
+        alert.setInformativeText(&NSString::from_str(if transcript.is_empty() {
+            "No messages yet. Combe owns this conversation; credentials remain in Keychain."
+        } else {
+            &transcript
+        }));
+        let fields = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(460.0, 66.0)),
+        );
+        let message = form_field(mtm, &fields, 36.0, "Continue this conversation…");
+        let picker = NSPopUpButton::initWithFrame_pullsDown(
+            NSPopUpButton::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 2.0), NSSize::new(460.0, 26.0)),
+            false,
+        );
+        for (recipient, profile) in &routes {
+            picker.addItemWithTitle(&NSString::from_str(&format!(
+                "{} — {:?} / {}",
+                recipient.name,
+                profile.service,
+                profile.model.as_deref().unwrap_or("no model")
+            )));
+        }
+        fields.addSubview(&picker);
+        alert.setAccessoryView(Some(&fields));
+        alert.addButtonWithTitle(&NSString::from_str("Send"));
+        alert.addButtonWithTitle(&NSString::from_str("Retry Last"));
+        alert.addButtonWithTitle(&NSString::from_str("Copy Response"));
+        alert.addButtonWithTitle(&NSString::from_str("Close"));
+        let response = alert.runModal();
+        if response == NSAlertFirstButtonReturn + 3 {
+            return;
+        }
+        if response == NSAlertFirstButtonReturn + 2 {
+            if let Some(content) = context
+                .recent_messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "assistant")
+                .map(|message| message.content.as_str())
+            {
+                copy_to_pasteboard(content);
+            }
+            continue;
+        }
+        let Ok(index) = usize::try_from(picker.indexOfSelectedItem()) else {
+            return;
+        };
+        let Some((recipient, _)) = routes.get(index) else {
+            return;
+        };
+        let credentials = KeychainCredentialStore::new();
+        let ollama = OllamaAdapter::new();
+        let claude = ClaudeCodeAdapter;
+        let chatgpt = ChatGptManualAdapter;
+        let chatgpt_api = ChatGptProvider::new();
+        let openai = OpenAiAdapter::new();
+        let runtime = ConversationRuntime::new(
+            &store,
+            &credentials,
+            vec![&ollama, &claude, &chatgpt, &chatgpt_api, &openai],
+        );
+        let mut streamed = String::new();
+        let mut update = |event| match event {
+            ConversationResponseEvent::Started => {}
+            ConversationResponseEvent::Delta(delta) => {
+                streamed.push_str(&delta);
+            }
+            ConversationResponseEvent::Completed => {}
+            ConversationResponseEvent::Failed(_) => {}
+        };
+        let worktree = context
+            .work_id
+            .as_ref()
+            .and_then(|id| store.load_work(id).ok().flatten())
+            .map(|work| work.workspace_id)
+            .or_else(|| {
+                STATE.with(|state| state.borrow().as_ref()?.tabs.current().map(str::to_owned))
+            })
+            .unwrap_or_else(|| "/".into());
+        let result = if response == NSAlertFirstButtonReturn {
+            runtime.send(
+                conversation_id,
+                &recipient.id,
+                &message.stringValue().to_string(),
+                std::path::Path::new(&worktree),
+                &mut update,
+            )
+        } else {
+            let input = context
+                .recent_messages
+                .iter()
+                .rev()
+                .find(|message| message.role == "user")
+                .map(|message| message.id.clone());
+            match input {
+                Some(input) => runtime.retry(
+                    conversation_id,
+                    &recipient.id,
+                    &input,
+                    std::path::Path::new(&worktree),
+                    &mut update,
+                ),
+                None => {
+                    show_work_error("There is no user message to retry.");
+                    continue;
+                }
+            }
+        };
+        if let Err(error) = result {
+            show_work_error(&format!("Your message is saved in Combe. {}", error));
+        }
     }
 }
 
@@ -1662,7 +2221,521 @@ fn layout_work_overview(state: &State) {
         return;
     };
     let bounds = state.content.bounds();
-    let width = bounds.size.width.clamp(460.0, 560.0);
+    let width = bounds.size.width.clamp(560.0, 640.0);
+    view.setFrame(NSRect::new(
+        NSPoint::new(bounds.size.width - width, 0.0),
+        NSSize::new(width, bounds.size.height),
+    ));
+    if let Some(tab) = state.tabs.active() {
+        tab.root.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new((bounds.size.width - width).max(0.0), bounds.size.height),
+        ));
+    }
+}
+
+fn dismiss_worktree_inspector() {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(state) = state.as_mut() else { return };
+        if let Some(view) = state.worktree_inspector.take() {
+            view.removeFromSuperview();
+        }
+        state.inspector_root = None;
+        state.inspector_file = None;
+        state.expanded_directories.clear();
+        if state.work_overview.is_none()
+            && let Some(tab) = state.tabs.active()
+        {
+            tab.root.setFrame(state.content.bounds());
+        }
+    });
+}
+
+fn open_worktree_inspector(root: &Path) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(state) = state.as_mut() else { return };
+        state.inspector_root = Some(root.to_path_buf());
+    });
+    render_worktree_inspector();
+}
+
+fn render_worktree_inspector() {
+    let mtm = MainThreadMarker::new().expect("main thread");
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(state) = state.as_mut() else { return };
+        let Some(root) = state.inspector_root.clone() else {
+            return;
+        };
+        if let Some(previous) = state.worktree_inspector.take() {
+            previous.removeFromSuperview();
+        }
+        let entries =
+            crate::worktree_inspector::tree(&root, &state.expanded_directories).unwrap_or_default();
+        let selected = state.inspector_file.clone();
+        let width = state.content.bounds().size.width.clamp(560.0, 640.0);
+        let tree_height = (entries.len() as f64 * 28.0 + 96.0).min(760.0);
+        let preview = selected
+            .as_deref()
+            .map(|path| crate::worktree_inspector::inspect_file(&root, path));
+        let preview_lines = match &preview {
+            Some(crate::worktree_inspector::FilePreview::Text { numbered, .. }) => {
+                numbered.lines().count()
+            }
+            _ => 0,
+        };
+        let document_height = (tree_height + preview_lines as f64 * 16.0 + 300.0)
+            .max(state.content.bounds().size.height)
+            .min(200_000.0);
+        let panel = NSScrollView::initWithFrame(
+            NSScrollView::alloc(mtm),
+            NSRect::new(
+                NSPoint::new(state.content.bounds().size.width - width, 0.0),
+                NSSize::new(width, state.content.bounds().size.height),
+            ),
+        );
+        panel.setHasVerticalScroller(true);
+        panel.setDrawsBackground(true);
+        panel.setBackgroundColor(&NSColor::windowBackgroundColor());
+        let document = NSView::initWithFrame(
+            NSView::alloc(mtm),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, document_height)),
+        );
+        let mut y = document_height - 34.0;
+        inspector_label(mtm, &document, "FILES", 16.0, y, width - 32.0, true);
+        y -= 30.0;
+        inspector_label(
+            mtm,
+            &document,
+            root.file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Workspace"),
+            16.0,
+            y,
+            width - 32.0,
+            false,
+        );
+        y -= 32.0;
+        for entry in entries {
+            let path = entry.path.clone();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            let disclosure = if entry.directory {
+                if entry.expanded { "▾" } else { "▸" }
+            } else {
+                " "
+            };
+            let title = format!("{} {} {}", entry.git.marker(), disclosure, name);
+            let row_path = path.clone();
+            let directory = entry.directory;
+            let row = ClickView::new(
+                mtm,
+                NSRect::new(NSPoint::new(12.0, y), NSSize::new(width - 24.0, 26.0)),
+                &title,
+                10.0 + entry.depth as f64 * 16.0,
+                8.0,
+                move || {
+                    if directory {
+                        toggle_inspector_directory(&row_path);
+                    } else {
+                        select_inspector_file(&row_path);
+                    }
+                },
+            );
+            row.set_selected(selected.as_ref() == Some(&path));
+            document.addSubview(&row);
+            y -= 28.0;
+        }
+        y -= 18.0;
+        if let Some(preview) = preview {
+            inspector_label(mtm, &document, "FILE", 16.0, y, width - 32.0, true);
+            y -= 30.0;
+            match preview {
+                crate::worktree_inspector::FilePreview::Text {
+                    path,
+                    content,
+                    numbered,
+                    byte_size,
+                    git,
+                    ..
+                } => {
+                    inspector_label(
+                        mtm,
+                        &document,
+                        &path.to_string_lossy(),
+                        16.0,
+                        y,
+                        width - 32.0,
+                        false,
+                    );
+                    y -= 24.0;
+                    inspector_label(
+                        mtm,
+                        &document,
+                        &format!("{byte_size} bytes · Git {}", git.marker().trim()),
+                        16.0,
+                        y,
+                        width - 32.0,
+                        false,
+                    );
+                    y -= 38.0;
+                    inspector_label(
+                        mtm,
+                        &document,
+                        &file_context_status(&root, &path),
+                        16.0,
+                        y,
+                        width - 32.0,
+                        false,
+                    );
+                    y -= 30.0;
+                    let actions = [
+                        ("Copy Path", 0),
+                        ("Copy Contents", 1),
+                        ("Find…", 2),
+                        ("Open in Terminal", 3),
+                        ("Reveal in Finder", 4),
+                        ("Add to Context", 5),
+                        ("Remove from Context", 6),
+                        ("Refresh", 7),
+                    ];
+                    for (index, (title, action)) in actions.into_iter().enumerate() {
+                        let action_path = path.clone();
+                        let column = index % 2;
+                        if column == 0 && index > 0 {
+                            y -= 34.0;
+                        }
+                        let button = ClickView::new(
+                            mtm,
+                            NSRect::new(
+                                NSPoint::new(16.0 + column as f64 * ((width - 40.0) / 2.0), y),
+                                NSSize::new((width - 48.0) / 2.0, 28.0),
+                            ),
+                            title,
+                            10.0,
+                            8.0,
+                            move || file_inspector_action(action, &action_path),
+                        );
+                        button.set_filled(true);
+                        document.addSubview(&button);
+                    }
+                    y -= 46.0;
+                    let text_height = (numbered.lines().count() as f64 * 16.0 + 20.0).max(120.0);
+                    let field = NSTextField::wrappingLabelWithString(&NSString::new(), mtm);
+                    field.setFrame(NSRect::new(
+                        NSPoint::new(16.0, (y - text_height).max(12.0)),
+                        NSSize::new(width - 32.0, text_height),
+                    ));
+                    field.setAttributedStringValue(&highlighted_source(&numbered, &path));
+                    field.setLineBreakMode(objc2_app_kit::NSLineBreakMode::ByClipping);
+                    document.addSubview(&field);
+                    let _ = content;
+                }
+                crate::worktree_inspector::FilePreview::Unavailable {
+                    path,
+                    reason,
+                    byte_size,
+                    ..
+                } => {
+                    inspector_label(
+                        mtm,
+                        &document,
+                        &path.to_string_lossy(),
+                        16.0,
+                        y,
+                        width - 32.0,
+                        false,
+                    );
+                    y -= 28.0;
+                    inspector_label(
+                        mtm,
+                        &document,
+                        &format!(
+                            "{}{}",
+                            reason,
+                            byte_size
+                                .map(|size| format!(" · {size} bytes"))
+                                .unwrap_or_default()
+                        ),
+                        16.0,
+                        y,
+                        width - 32.0,
+                        false,
+                    );
+                    y -= 38.0;
+                    let action_path = path.clone();
+                    let button = ClickView::new(
+                        mtm,
+                        NSRect::new(NSPoint::new(16.0, y), NSSize::new(width - 32.0, 30.0)),
+                        "Open in Terminal",
+                        10.0,
+                        8.0,
+                        move || file_inspector_action(3, &action_path),
+                    );
+                    button.set_filled(true);
+                    document.addSubview(&button);
+                }
+            }
+        } else {
+            inspector_label(
+                mtm,
+                &document,
+                "Select a file to inspect its contents and context status.",
+                16.0,
+                y,
+                width - 32.0,
+                false,
+            );
+        }
+        panel.setDocumentView(Some(&document));
+        state.content.addSubview(&panel);
+        state.worktree_inspector = Some(panel);
+        layout_worktree_inspector(state);
+    });
+}
+
+fn file_context_status(root: &Path, path: &Path) -> String {
+    let Ok(store) = FeltDbWorkStore::for_combe() else {
+        return "CONTEXT · unavailable".into();
+    };
+    let root = root.to_string_lossy();
+    let Ok(works) = store.list_works(Some(&root)) else {
+        return "CONTEXT · unavailable".into();
+    };
+    let Some(work) = works
+        .iter()
+        .find(|work| work.status == combe_state::WorkStatus::Active)
+        .or_else(|| works.first())
+    else {
+        return "CONTEXT · create Work to add this file".into();
+    };
+    let path = path.to_string_lossy().replace('\\', "/");
+    let hint = store
+        .context_file_hints(&work.id)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|hint| hint.path == path);
+    match hint.map(|hint| hint.disposition) {
+        Some(combe_state::ContextFileDisposition::Include) => {
+            format!("CONTEXT · explicitly included for {}", work.title)
+        }
+        Some(combe_state::ContextFileDisposition::Exclude) => {
+            format!("CONTEXT · explicitly excluded from {}", work.title)
+        }
+        None => format!("CONTEXT · automatic selection for {}", work.title),
+    }
+}
+
+fn highlighted_source(value: &str, path: &Path) -> Retained<NSMutableAttributedString> {
+    let attributed = NSMutableAttributedString::from_nsstring(&NSString::from_str(value));
+    let length = value.encode_utf16().count();
+    let font = NSFont::userFixedPitchFontOfSize(12.0)
+        .unwrap_or_else(|| NSFont::systemFontOfSize(12.0));
+    unsafe {
+        attributed.addAttribute_value_range(
+            NSFontAttributeName,
+            &font,
+            NSRange::new(0, length),
+        );
+        attributed.addAttribute_value_range(
+            NSForegroundColorAttributeName,
+            &NSColor::labelColor(),
+            NSRange::new(0, length),
+        );
+    }
+    let extension = path.extension().and_then(|value| value.to_str()).unwrap_or("");
+    let keywords: &[&str] = match extension {
+        "rs" => &["fn", "let", "mut", "pub", "struct", "enum", "impl", "use", "match", "if", "else", "return", "self", "Self"],
+        "ts" | "tsx" | "js" | "jsx" => &["function", "const", "let", "class", "interface", "type", "export", "import", "from", "return", "async", "await", "if", "else"],
+        "py" => &["def", "class", "import", "from", "return", "async", "await", "if", "else", "for", "in"],
+        "go" => &["func", "type", "struct", "interface", "package", "import", "return", "go", "defer", "if", "else"],
+        _ => &[],
+    };
+    let color = NSColor::systemBlueColor();
+    for keyword in keywords {
+        let mut offset = 0;
+        while let Some(found) = value[offset..].find(keyword) {
+            let start = offset + found;
+            let end = start + keyword.len();
+            let before = value[..start].chars().next_back();
+            let after = value[end..].chars().next();
+            if before.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+                && after.is_none_or(|character| !character.is_alphanumeric() && character != '_')
+            {
+                let utf16_start = value[..start].encode_utf16().count();
+                let utf16_length = value[start..end].encode_utf16().count();
+                unsafe {
+                    attributed.addAttribute_value_range(
+                        NSForegroundColorAttributeName,
+                        &color,
+                        NSRange::new(utf16_start, utf16_length),
+                    );
+                }
+            }
+            offset = end;
+        }
+    }
+    attributed
+}
+
+fn inspector_label(
+    mtm: MainThreadMarker,
+    parent: &NSView,
+    value: &str,
+    x: f64,
+    y: f64,
+    width: f64,
+    heading: bool,
+) {
+    let label = NSTextField::labelWithString(&NSString::from_str(value), mtm);
+    label.setFrame(NSRect::new(NSPoint::new(x, y), NSSize::new(width, 20.0)));
+    let font = if heading {
+        NSFont::boldSystemFontOfSize(11.0)
+    } else {
+        NSFont::systemFontOfSize(13.0)
+    };
+    label.setFont(Some(&font));
+    if heading {
+        label.setTextColor(Some(&NSColor::systemBlueColor()));
+    }
+    parent.addSubview(&label);
+}
+
+fn toggle_inspector_directory(path: &Path) {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(state) = state.as_mut() else { return };
+        if !state.expanded_directories.remove(path) {
+            state.expanded_directories.insert(path.to_path_buf());
+        }
+    });
+    render_worktree_inspector();
+}
+
+fn select_inspector_file(path: &Path) {
+    STATE.with(|state| {
+        if let Some(state) = state.borrow_mut().as_mut() {
+            state.inspector_file = Some(path.to_path_buf());
+        }
+    });
+    render_worktree_inspector();
+}
+
+fn file_inspector_action(action: usize, path: &Path) {
+    let root = STATE.with(|state| {
+        state
+            .borrow()
+            .as_ref()
+            .and_then(|state| state.inspector_root.clone())
+    });
+    let Some(root) = root else { return };
+    let absolute = root.join(path);
+    match action {
+        0 => copy_to_pasteboard(&path.to_string_lossy()),
+        1 => {
+            if let crate::worktree_inspector::FilePreview::Text { content, .. } =
+                crate::worktree_inspector::inspect_file(&root, path)
+            {
+                copy_to_pasteboard(&content);
+            }
+        }
+        2 => find_in_inspected_file(&root, path),
+        3 => run_in_focused_terminal(&format!(
+            "less -- {}\r",
+            shell_word(&path.to_string_lossy())
+        )),
+        4 => {
+            let _ = std::process::Command::new("open")
+                .arg("-R")
+                .arg(absolute)
+                .spawn();
+        }
+        5 => set_file_context_hint(&root, path, combe_state::ContextFileDisposition::Include),
+        6 => set_file_context_hint(&root, path, combe_state::ContextFileDisposition::Exclude),
+        _ => render_worktree_inspector(),
+    }
+}
+
+fn find_in_inspected_file(root: &Path, path: &Path) {
+    let crate::worktree_inspector::FilePreview::Text { content, .. } =
+        crate::worktree_inspector::inspect_file(root, path)
+    else {
+        return;
+    };
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Find in File"));
+    let field = NSTextField::textFieldWithString(&NSString::new(), mtm);
+    field.setFrame(NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(360.0, 24.0),
+    ));
+    alert.setAccessoryView(Some(&field));
+    alert.addButtonWithTitle(&NSString::from_str("Find"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    if alert.runModal() != NSAlertFirstButtonReturn {
+        return;
+    }
+    let query = field.stringValue().to_string();
+    let lines = crate::worktree_inspector::search_lines(&content, &query);
+    let result = if lines.is_empty() {
+        format!("No matches for “{query}”.")
+    } else {
+        format!(
+            "{} match(es) on lines {}.",
+            lines.len(),
+            lines
+                .iter()
+                .take(40)
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    show_work_message("Find in File", &result);
+}
+
+fn set_file_context_hint(
+    root: &Path,
+    path: &Path,
+    disposition: combe_state::ContextFileDisposition,
+) {
+    let root = root.to_string_lossy();
+    let result = (|| {
+        let store = FeltDbWorkStore::for_combe()?;
+        let works = store.list_works(Some(&root))?;
+        let work = works
+            .iter()
+            .find(|work| work.status == combe_state::WorkStatus::Active)
+            .or_else(|| works.first())
+            .ok_or_else(|| {
+                combe_state::StateError::InvalidEntity(
+                    "Create or select Work for this Worktree before changing its context.".into(),
+                )
+            })?;
+        store.set_context_file_hint(combe_state::WorkContextFileHint {
+            work_id: work.id.clone(),
+            path: path.to_string_lossy().replace('\\', "/"),
+            disposition,
+            updated_at: Utc::now(),
+        })
+    })();
+    match result {
+        Ok(()) => render_worktree_inspector(),
+        Err(error) => show_work_error(&error.to_string()),
+    }
+}
+
+fn layout_worktree_inspector(state: &State) {
+    let Some(view) = state.worktree_inspector.as_ref() else {
+        return;
+    };
+    let bounds = state.content.bounds();
+    let width = bounds.size.width.clamp(560.0, 640.0);
     view.setFrame(NSRect::new(
         NSPoint::new(bounds.size.width - width, 0.0),
         NSSize::new(width, bounds.size.height),
@@ -1681,6 +2754,442 @@ fn leaf_name(path: &str) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or(path)
         .to_string()
+}
+
+fn import_chatgpt_history() {
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let panel = NSOpenPanel::openPanel(mtm);
+    panel.setCanChooseFiles(true);
+    panel.setCanChooseDirectories(false);
+    panel.setAllowsMultipleSelection(true);
+    panel.setPrompt(Some(&NSString::from_str("Review Export")));
+    panel.setMessage(Some(&NSString::from_str(
+        "Choose one official ChatGPT export ZIP, conversations.json, or numbered conversation JSON files. Processing stays on this Mac.",
+    )));
+    if panel.runModal() != objc2_app_kit::NSModalResponseOK {
+        return;
+    }
+    let paths = panel
+        .URLs()
+        .iter()
+        .filter_map(|url| url.path())
+        .map(|path| PathBuf::from(path.to_string()))
+        .collect::<Vec<_>>();
+    let acquisition = match crate::chatgpt_history::acquire_paths(&paths) {
+        Ok(acquisition) => acquisition,
+        Err(error) => {
+            show_work_error(&error.to_string());
+            return;
+        }
+    };
+    review_chatgpt_acquisition(acquisition);
+}
+
+fn review_chatgpt_acquisition(acquisition: crate::chatgpt_history::ChatGptAcquisition) {
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let imported = FeltDbWorkStore::for_combe()
+        .and_then(|store| store.chatgpt_conversations(None))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|conversation| (conversation.conversation_id, conversation.fingerprint))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let already_imported = acquisition
+        .conversations
+        .iter()
+        .filter(|conversation| imported.contains_key(&conversation.conversation_id))
+        .count();
+    let message_count = acquisition
+        .conversations
+        .iter()
+        .map(|conversation| conversation.messages.len())
+        .sum::<usize>();
+    let search_alert = NSAlert::new(mtm);
+    search_alert.setMessageText(&NSString::from_str("Import ChatGPT History"));
+    search_alert.setInformativeText(&NSString::from_str(&format!(
+        "Found {} conversations and {} messages · {} already imported · {} new · {} empty or metadata-only · {} with attachments. Search locally before choosing what to import.",
+        acquisition.conversations.len(),
+        message_count,
+        already_imported,
+        acquisition.conversations.len() - already_imported,
+        acquisition.empty_count,
+        acquisition.attachment_count
+    )));
+    let fields = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(440.0, 118.0)),
+    );
+    let query = form_field(
+        mtm,
+        &fields,
+        92.0,
+        "Search titles, projects, topics, and messages",
+    );
+    let from = form_field(mtm, &fields, 62.0, "From date (YYYY-MM-DD, optional)");
+    let through = form_field(mtm, &fields, 32.0, "Through date (YYYY-MM-DD, optional)");
+    let import_state = form_field(mtm, &fields, 2.0, "Show: new, imported, changed, or all");
+    search_alert.setAccessoryView(Some(&fields));
+    search_alert.addButtonWithTitle(&NSString::from_str("Review Matches"));
+    search_alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    if search_alert.runModal() != NSAlertFirstButtonReturn {
+        return;
+    }
+    let query = query.stringValue().to_string();
+    let from_value = from.stringValue().to_string();
+    let through_value = through.stringValue().to_string();
+    let import_state = import_state.stringValue().to_string().to_lowercase();
+    let from = parse_history_date(&from_value);
+    let through = parse_history_date(&through_value);
+    if (!from_value.trim().is_empty() && from.is_none())
+        || (!through_value.trim().is_empty() && through.is_none())
+    {
+        show_work_error("Dates must use YYYY-MM-DD.");
+        return;
+    }
+    let matches = acquisition
+        .conversations
+        .iter()
+        .enumerate()
+        .filter(|(_, conversation)| {
+            let prior = imported.get(&conversation.conversation_id);
+            let state_matches = match import_state.trim() {
+                "new" => prior.is_none(),
+                "imported" => prior.is_some(),
+                "changed" => {
+                    prior.is_some_and(|fingerprint| fingerprint != &conversation.fingerprint)
+                }
+                _ => true,
+            };
+            crate::chatgpt_history::matches(conversation, &query)
+                && history_date_matches(conversation, from, through)
+                && state_matches
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if matches.is_empty() {
+        show_work_message(
+            "Import ChatGPT History",
+            "No conversations match those filters.",
+        );
+        return;
+    }
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Review ChatGPT Conversations"));
+    alert.setInformativeText(&NSString::from_str(&format!(
+        "{} conversations match. The first {} are shown; narrow the search for finer selection.",
+        matches.len(),
+        matches.len().min(100)
+    )));
+    let visible = matches.iter().take(100).copied().collect::<Vec<_>>();
+    let document_height = (visible.len() as f64 * 42.0).max(280.0);
+    let document = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(520.0, document_height)),
+    );
+    let mut checkboxes = Vec::new();
+    for (row, index) in visible.iter().enumerate() {
+        let conversation = &acquisition.conversations[*index];
+        let attachment_count = conversation
+            .messages
+            .iter()
+            .filter(|message| !message.attachments.is_empty())
+            .count();
+        let date = conversation
+            .updated_at
+            .or(conversation.created_at)
+            .map(|value| value.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "No date".into());
+        let snippet = conversation
+            .messages
+            .iter()
+            .find(|message| !message.content.trim().is_empty())
+            .map(|message| bounded_label(&message.content, 72))
+            .unwrap_or_else(|| "Metadata only".into());
+        let title = format!(
+            "{}  ·  {} messages  ·  {} attachments  ·  {}\n{}",
+            conversation
+                .title
+                .as_deref()
+                .unwrap_or("Untitled conversation"),
+            conversation.messages.len(),
+            attachment_count,
+            date,
+            snippet
+        );
+        let checkbox = unsafe {
+            NSButton::checkboxWithTitle_target_action(&NSString::from_str(&title), None, None, mtm)
+        };
+        checkbox.setFrame(NSRect::new(
+            NSPoint::new(4.0, document_height - ((row + 1) as f64 * 42.0)),
+            NSSize::new(510.0, 40.0),
+        ));
+        document.addSubview(&checkbox);
+        checkboxes.push(checkbox);
+    }
+    let scroll = NSScrollView::initWithFrame(
+        NSScrollView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(540.0, 320.0)),
+    );
+    scroll.setHasVerticalScroller(true);
+    scroll.setDocumentView(Some(&document));
+    alert.setAccessoryView(Some(&scroll));
+    alert.addButtonWithTitle(&NSString::from_str("Import Selected"));
+    alert.addButtonWithTitle(&NSString::from_str("Import All Matches"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let response = alert.runModal();
+    let selected = if response == NSAlertFirstButtonReturn {
+        visible
+            .into_iter()
+            .zip(checkboxes.iter())
+            .filter(|(_, checkbox)| checkbox.state() == NSControlStateValueOn)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    } else if response == NSAlertFirstButtonReturn + 1 {
+        matches
+    } else {
+        return;
+    };
+    if selected.is_empty() {
+        show_work_message("Import ChatGPT History", "No conversations were selected.");
+        return;
+    }
+    let mut source = acquisition.source;
+    let conversations = selected
+        .into_iter()
+        .map(|index| acquisition.conversations[index].clone())
+        .collect::<Vec<_>>();
+    source.conversation_count = conversations.len();
+    match FeltDbWorkStore::for_combe()
+        .and_then(|store| store.import_chatgpt_source(source, conversations.clone()))
+    {
+        Ok(result) => show_work_message(
+            "ChatGPT History Imported",
+            &format!(
+                "{} new conversations · {} updated · {} new messages · {} duplicates · {} skipped. Imported history is available to bounded Combe search and context resolution.",
+                result.new_conversations,
+                result.updated_conversations,
+                result.new_messages,
+                result.duplicate_conversations,
+                result.skipped_conversations
+            ),
+        ),
+        Err(error) => show_work_error(&error.to_string()),
+    }
+}
+
+fn parse_history_date(value: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()
+}
+
+fn history_date_matches(
+    conversation: &ChatGptHistoryConversation,
+    from: Option<chrono::NaiveDate>,
+    through: Option<chrono::NaiveDate>,
+) -> bool {
+    let date = conversation
+        .updated_at
+        .or(conversation.created_at)
+        .map(|value| value.date_naive());
+    from.is_none_or(|from| date.is_some_and(|date| date >= from))
+        && through.is_none_or(|through| date.is_some_and(|date| date <= through))
+}
+
+fn bounded_label(value: &str, limit: usize) -> String {
+    let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut result = value.chars().take(limit).collect::<String>();
+    if value.chars().count() > limit {
+        result.push('…');
+    }
+    result
+}
+
+fn manage_chatgpt_history() {
+    let Ok(store) = FeltDbWorkStore::for_combe() else {
+        show_work_error("ChatGPT history is unavailable.");
+        return;
+    };
+    let sources = match store.chatgpt_sources() {
+        Ok(sources) => sources,
+        Err(error) => {
+            show_work_error(&error.to_string());
+            return;
+        }
+    };
+    if sources.is_empty() {
+        show_work_message(
+            "Imported ChatGPT History",
+            "No ChatGPT exports have been imported.",
+        );
+        return;
+    }
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Manage Imported ChatGPT History"));
+    alert.setInformativeText(&NSString::from_str(
+        "Delete an imported source and all of its normalized conversations. Work records remain unchanged.",
+    ));
+    for source in &sources {
+        alert.addButtonWithTitle(&NSString::from_str(&format!(
+            "Delete {} · {} conversations…",
+            source.display_name, source.conversation_count
+        )));
+    }
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let Ok(index) = usize::try_from(alert.runModal() - NSAlertFirstButtonReturn) else {
+        return;
+    };
+    let Some(source) = sources.get(index) else {
+        return;
+    };
+    let confirm = NSAlert::new(mtm);
+    confirm.setMessageText(&NSString::from_str("Delete Imported History?"));
+    confirm.setInformativeText(&NSString::from_str(&format!(
+        "This removes {} normalized conversations imported from {}. The original export file is not changed.",
+        source.conversation_count, source.display_name
+    )));
+    confirm.addButtonWithTitle(&NSString::from_str("Delete"));
+    confirm.addButtonWithTitle(&NSString::from_str("Cancel"));
+    if confirm.runModal() == NSAlertFirstButtonReturn
+        && let Err(error) = store.delete_chatgpt_source(&source.id)
+    {
+        show_work_error(&error.to_string());
+    }
+}
+
+fn attach_chatgpt_history() {
+    let work_id = STATE.with(|state| state.borrow().as_ref()?.selected_work.clone());
+    let Some(work_id) = work_id else {
+        show_work_error("Select a Work before attaching ChatGPT history.");
+        return;
+    };
+    let Ok(store) = FeltDbWorkStore::for_combe() else {
+        show_work_error("ChatGPT history is unavailable.");
+        return;
+    };
+    let conversations = match store.chatgpt_conversations(None) {
+        Ok(conversations) => conversations,
+        Err(error) => {
+            show_work_error(&error.to_string());
+            return;
+        }
+    };
+    if conversations.is_empty() {
+        show_work_message("Attach ChatGPT History", "Import ChatGPT history first.");
+        return;
+    }
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Attach ChatGPT History to Work"));
+    alert.setInformativeText(&NSString::from_str(
+        "Choose one imported conversation. A bounded transcript becomes explicit Work context; the complete normalized history remains separate.",
+    ));
+    let values = conversations
+        .iter()
+        .map(|conversation| {
+            format!(
+                "{} · {} messages",
+                conversation
+                    .title
+                    .as_deref()
+                    .unwrap_or("Untitled conversation"),
+                conversation.messages.len()
+            )
+        })
+        .collect::<Vec<_>>();
+    let accessory = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(440.0, 28.0)),
+    );
+    let combo = form_combo(mtm, &accessory, 2.0, "Imported conversation", &values);
+    alert.setAccessoryView(Some(&accessory));
+    alert.addButtonWithTitle(&NSString::from_str("Attach"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    if alert.runModal() != NSAlertFirstButtonReturn {
+        return;
+    }
+    let Ok(index) = usize::try_from(combo.indexOfSelectedItem()) else {
+        show_work_error("Choose an imported conversation.");
+        return;
+    };
+    let Some(conversation) = conversations.get(index) else {
+        show_work_error("Choose an imported conversation.");
+        return;
+    };
+    if let Err(error) = attach_history_conversation(&store, &work_id, conversation) {
+        show_work_error(&error.to_string());
+        return;
+    }
+    dismiss_work_overview();
+    open_work_overview(&work_id);
+}
+
+fn attach_history_conversation(
+    store: &FeltDbWorkStore,
+    work_id: &WorkId,
+    imported: &ChatGptHistoryConversation,
+) -> combe_state::Result<()> {
+    if store
+        .conversations(work_id)?
+        .iter()
+        .any(|conversation| conversation.conversation.id == imported.conversation_id)
+    {
+        return Err(combe_state::StateError::InvalidEntity(
+            "this ChatGPT conversation is already attached to the selected Work".into(),
+        ));
+    }
+    let participant = if let Some(participant) = store.find_participant(work_id, "ChatGPT")? {
+        participant
+    } else {
+        let participant =
+            Participant::new(work_id.clone(), ParticipantKind::Agent, "ChatGPT".into());
+        store.add_participant(participant.clone())?;
+        participant
+    };
+    let reference = ConversationRef {
+        id: imported.conversation_id.clone(),
+        provider: ConversationProvider::ChatGpt,
+        title: imported.title.clone(),
+    };
+    let conversation = WorkConversation {
+        id: ConversationId::new(),
+        work_id: work_id.clone(),
+        conversation: reference.clone(),
+        participant_id: participant.id.clone(),
+        label: imported.title.clone(),
+        created_at: Utc::now(),
+    };
+    let mut transcript = String::new();
+    for message in &imported.messages {
+        if message.content.trim().is_empty() {
+            continue;
+        }
+        let role = message.role.as_deref().unwrap_or("unknown");
+        let entry = format!("{role}: {}\n\n", message.content.trim());
+        if transcript.len() + entry.len() > 15 * 1024 {
+            transcript.push_str("[Earlier export content truncated at the Work import boundary]");
+            break;
+        }
+        transcript.push_str(&entry);
+    }
+    if transcript.is_empty() {
+        transcript = "Imported ChatGPT conversation contains metadata only.".into();
+    }
+    store.import_contribution(
+        conversation,
+        WorkTurn {
+            id: TurnId::new(),
+            work_id: work_id.clone(),
+            participant_id: participant.id,
+            kind: TurnKind::Message,
+            content: transcript,
+            created_at: imported
+                .updated_at
+                .or(imported.created_at)
+                .unwrap_or_else(Utc::now),
+            assignment_id: None,
+            execution_id: None,
+            origin: TurnOrigin::ExternalConversation(reference),
+        },
+    )
 }
 
 fn configure_recipients() {
@@ -1737,34 +3246,201 @@ fn manage_provider(store: &FeltDbWorkStore, profile: &ProviderProfile) {
             "Disabled"
         }
     )));
-    for title in [
-        "Test Connection",
-        "Add Recipient…",
-        if profile.enabled { "Disable" } else { "Enable" },
-        "Delete Provider",
-        "Cancel",
-    ] {
-        alert.addButtonWithTitle(&NSString::from_str(title));
-    }
+    let dependent_count = store
+        .list_recipients()
+        .unwrap_or_default()
+        .iter()
+        .filter(|recipient| recipient.provider_profile_id == profile.id)
+        .count();
+    alert.addButtonWithTitle(&NSString::from_str("Edit Configuration…"));
+    alert.addButtonWithTitle(&NSString::from_str("Test Connection"));
+    alert.addButtonWithTitle(&NSString::from_str("Add Recipient…"));
+    alert.addButtonWithTitle(&NSString::from_str(if profile.enabled {
+        "Disable"
+    } else {
+        "Enable"
+    }));
+    alert.addButtonWithTitle(&NSString::from_str(&if dependent_count == 0 {
+        "Delete Provider…".into()
+    } else if dependent_count == 1 {
+        "Delete Provider and 1 Recipient…".into()
+    } else {
+        format!("Delete Provider and {dependent_count} Recipients…")
+    }));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
     match alert.runModal() - NSAlertFirstButtonReturn {
-        0 => test_profile_in_ui(store, profile),
-        1 => create_recipient_for_profile(store, profile),
-        2 => {
+        0 => edit_provider(store, profile),
+        1 => test_profile_in_ui(store, profile),
+        2 => create_recipient_for_profile(store, profile),
+        3 => {
             let mut updated = profile.clone();
             updated.enabled = !updated.enabled;
             if let Err(error) = store.update_profile(updated) {
                 show_work_error(&error.to_string());
             }
         }
-        3 => match store.delete_profile(&profile.id) {
-            Ok(()) => {
-                if let Some(reference) = profile.credential_ref.as_ref() {
-                    let _ = KeychainCredentialStore::new().delete(reference);
-                }
-            }
-            Err(error) => show_work_error(&error.to_string()),
-        },
+        4 => delete_provider_in_ui(store, profile),
         _ => {}
+    }
+}
+
+fn edit_provider(store: &FeltDbWorkStore, profile: &ProviderProfile) {
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let api_credential = profile.execution_mode == ExecutionMode::HttpApi;
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Edit Provider"));
+    alert.setInformativeText(&NSString::from_str(&format!(
+        "{:?} · {:?}. Leave the credential blank to keep the existing Keychain value.",
+        profile.service, profile.execution_mode
+    )));
+    let fields = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(380.0, 120.0)),
+    );
+    let name = form_field(mtm, &fields, 92.0, "Provider profile name");
+    name.setStringValue(&NSString::from_str(&profile.name));
+    let model_values = match profile.service {
+        ProviderService::Ollama => OllamaAdapter::new()
+            .models(
+                profile
+                    .endpoint
+                    .as_deref()
+                    .unwrap_or("http://127.0.0.1:11434"),
+            )
+            .unwrap_or_default(),
+        ProviderService::ClaudeCode => vec!["sonnet".into(), "opus".into(), "fable".into()],
+        ProviderService::ChatGpt if profile.execution_mode == ExecutionMode::ExternalManual => {
+            vec!["ChatGPT Conversation".into()]
+        }
+        ProviderService::ChatGpt | ProviderService::OpenAiApi => vec![
+            "gpt-6-astra".into(),
+            "gpt-5.6-sol".into(),
+            "gpt-5.6-terra".into(),
+            "gpt-5.6-luna".into(),
+        ],
+    };
+    let model = form_combo(mtm, &fields, 62.0, "Model", &model_values);
+    model.setStringValue(&NSString::from_str(profile.model.as_deref().unwrap_or("")));
+    let endpoint = form_field(mtm, &fields, 32.0, "Endpoint");
+    endpoint.setStringValue(&NSString::from_str(
+        profile.endpoint.as_deref().unwrap_or(""),
+    ));
+    endpoint.setEnabled(profile.service == ProviderService::Ollama);
+    let credential = NSSecureTextField::initWithFrame(
+        NSSecureTextField::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 2.0), NSSize::new(380.0, 24.0)),
+    );
+    credential.setPlaceholderString(Some(&NSString::from_str(if api_credential {
+        "New API key (leave blank to keep existing)"
+    } else {
+        "No credential managed by Combe"
+    })));
+    credential.setEnabled(api_credential);
+    fields.addSubview(&credential);
+    alert.setAccessoryView(Some(&fields));
+    alert.addButtonWithTitle(&NSString::from_str("Save"));
+    alert.addButtonWithTitle(&NSString::from_str("Save & Test"));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let response = alert.runModal();
+    if response != NSAlertFirstButtonReturn && response != NSAlertFirstButtonReturn + 1 {
+        return;
+    }
+    let mut updated = profile.clone();
+    updated.name = name.stringValue().to_string().trim().into();
+    let model = model.stringValue().to_string();
+    updated.model = (!model.trim().is_empty()).then(|| model.trim().into());
+    if updated.name.is_empty() {
+        show_work_error("Provider profile name is required.");
+        return;
+    }
+    if profile.service == ProviderService::Ollama {
+        let endpoint = endpoint.stringValue().to_string();
+        updated.endpoint = Some(if endpoint.trim().is_empty() {
+            "http://127.0.0.1:11434".into()
+        } else {
+            endpoint.trim().into()
+        });
+    }
+    let key = credential.stringValue().to_string();
+    if api_credential && !key.is_empty() {
+        let reference = updated
+            .credential_ref
+            .clone()
+            .unwrap_or_else(|| CredentialRef(format!("openai/{}", updated.id.0)));
+        if let Err(error) =
+            KeychainCredentialStore::new().set(&reference, Credential::new(key.as_bytes()))
+        {
+            show_work_error(&error.to_string());
+            return;
+        }
+        updated.credential_ref = Some(reference);
+    }
+    if let Err(error) = store.update_profile(updated.clone()) {
+        show_work_error(&error.to_string());
+        return;
+    }
+    if response == NSAlertFirstButtonReturn + 1 {
+        test_profile_in_ui(store, &updated);
+    }
+    refresh_open_work();
+}
+
+fn delete_provider_in_ui(store: &FeltDbWorkStore, profile: &ProviderProfile) {
+    let dependents = store
+        .list_recipients()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|recipient| recipient.provider_profile_id == profile.id)
+        .collect::<Vec<_>>();
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let alert = NSAlert::new(mtm);
+    alert.setAlertStyle(NSAlertStyle::Warning);
+    alert.setMessageText(&NSString::from_str(&format!("Delete {}?", profile.name)));
+    let names = dependents
+        .iter()
+        .map(|recipient| recipient.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    alert.setInformativeText(&NSString::from_str(&if dependents.is_empty() {
+        "This removes the provider configuration and its Keychain credential.".into()
+    } else {
+        format!(
+            "This also deletes {} dependent recipient{}: {}.",
+            dependents.len(),
+            if dependents.len() == 1 { "" } else { "s" },
+            names
+        )
+    }));
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    alert.addButtonWithTitle(&NSString::from_str(if dependents.is_empty() {
+        "Delete Provider"
+    } else {
+        "Delete Provider and Recipients"
+    }));
+    if alert.runModal() != NSAlertFirstButtonReturn + 1 {
+        return;
+    }
+    for recipient in &dependents {
+        if let Err(error) = store.delete_recipient(&recipient.id) {
+            show_work_error(&error.to_string());
+            return;
+        }
+    }
+    match store.delete_profile(&profile.id) {
+        Ok(()) => {
+            if let Some(reference) = profile.credential_ref.as_ref() {
+                let _ = KeychainCredentialStore::new().delete(reference);
+            }
+            refresh_open_work();
+        }
+        Err(error) => show_work_error(&error.to_string()),
+    }
+}
+
+fn refresh_open_work() {
+    if let Some(id) = STATE.with(|state| state.borrow().as_ref()?.selected_work.clone()) {
+        dismiss_work_overview();
+        open_work_overview(&id);
     }
 }
 
@@ -1814,9 +3490,15 @@ fn create_provider_and_recipient(store: &FeltDbWorkStore) {
     let chooser = NSAlert::new(mtm);
     chooser.setMessageText(&NSString::from_str("Provider Service"));
     chooser.setInformativeText(&NSString::from_str(
-        "ChatGPT is manual. OpenAI API is a separate credentialed service.",
+        "Ollama is local. Claude Code uses its CLI account. ChatGPT can use the OpenAI API or manual browser transfer. API credentials remain in Keychain.",
     ));
-    for title in ["Ollama", "Claude Code", "ChatGPT (Manual)", "OpenAI API"] {
+    for title in [
+        "Ollama",
+        "Claude Code",
+        "ChatGPT API",
+        "ChatGPT (Manual)",
+        "OpenAI API",
+    ] {
         chooser.addButtonWithTitle(&NSString::from_str(title));
     }
     chooser.addButtonWithTitle(&NSString::from_str("Cancel"));
@@ -1826,6 +3508,7 @@ fn create_provider_and_recipient(store: &FeltDbWorkStore) {
     let Some((service, mode)) = [
         (ProviderService::Ollama, ExecutionMode::LocalHttp),
         (ProviderService::ClaudeCode, ExecutionMode::LocalCli),
+        (ProviderService::ChatGpt, ExecutionMode::HttpApi),
         (ProviderService::ChatGpt, ExecutionMode::ExternalManual),
         (ProviderService::OpenAiApi, ExecutionMode::HttpApi),
     ]
@@ -1835,36 +3518,40 @@ fn create_provider_and_recipient(store: &FeltDbWorkStore) {
     };
     let profile_id = ProviderProfileId::new();
     let ollama_endpoint = "http://127.0.0.1:11434";
-    let model_values = match service {
-        ProviderService::Ollama => OllamaAdapter::new()
+    let api_credential = mode == ExecutionMode::HttpApi;
+    let model_values = match (service, mode) {
+        (ProviderService::Ollama, _) => OllamaAdapter::new()
             .models(ollama_endpoint)
             .unwrap_or_default(),
-        ProviderService::ClaudeCode => vec!["sonnet".into(), "opus".into(), "fable".into()],
-        ProviderService::ChatGpt => vec!["ChatGPT Conversation".into()],
-        ProviderService::OpenAiApi => vec![
+        (ProviderService::ClaudeCode, _) => vec!["sonnet".into(), "opus".into(), "fable".into()],
+        (ProviderService::ChatGpt, ExecutionMode::ExternalManual) => {
+            vec!["ChatGPT Conversation".into()]
+        }
+        (ProviderService::ChatGpt | ProviderService::OpenAiApi, _) => vec![
             "gpt-6-astra".into(),
             "gpt-5.6-sol".into(),
             "gpt-5.6-terra".into(),
             "gpt-5.6-luna".into(),
         ],
     };
-    let credential_ref = (service == ProviderService::OpenAiApi)
-        .then(|| CredentialRef(format!("openai/{}", profile_id.0)));
+    let credential_ref = api_credential.then(|| CredentialRef(format!("openai/{}", profile_id.0)));
     let alert = NSAlert::new(mtm);
     alert.setMessageText(&NSString::from_str("New Provider Recipient"));
-    let information = if service == ProviderService::Ollama {
-        if model_values.is_empty() {
-            "The local Ollama service could not be queried. Enter an installed model explicitly."
+    let information = match (service, mode) {
+        (ProviderService::Ollama, _) if model_values.is_empty() => {
+            "Local Ollama requires no sign-in. The service could not be queried, so enter an installed model explicitly."
                 .into()
-        } else {
-            format!(
-                "Found {} installed Ollama models. Select one below.",
-                model_values.len()
-            )
         }
-    } else {
-        "Configuration persists in FeltDB. API credentials are stored only in macOS Keychain."
-            .into()
+        (ProviderService::Ollama, _) => format!(
+            "Local Ollama requires no sign-in. Found {} installed models.",
+            model_values.len()
+        ),
+        (ProviderService::ClaudeCode, _) => ClaudeCodeAdapter::authentication_status()
+            .unwrap_or_else(|error| error.to_string()),
+        (ProviderService::ChatGpt, ExecutionMode::ExternalManual) => "Uses your existing ChatGPT browser conversation and sign-in, including Google. Combe does not access that session; transfer remains manual."
+            .into(),
+        (ProviderService::ChatGpt | ProviderService::OpenAiApi, _) => "OpenAI API access is separate from ChatGPT web sign-in and billing. Its API key is stored only in macOS Keychain."
+            .into(),
     };
     alert.setInformativeText(&NSString::from_str(&information));
     let fields = NSView::initWithFrame(
@@ -1873,11 +3560,14 @@ fn create_provider_and_recipient(store: &FeltDbWorkStore) {
     );
     let profile_name = form_field(mtm, &fields, 122.0, "Provider profile name");
     let recipient_name = form_field(mtm, &fields, 92.0, "Recipient display name");
-    let (default_profile, default_recipient) = match service {
-        ProviderService::Ollama => ("Ollama Local", "Local Ollama"),
-        ProviderService::ClaudeCode => ("Claude Code", "Claude Code"),
-        ProviderService::ChatGpt => ("ChatGPT Conversation", "ChatGPT"),
-        ProviderService::OpenAiApi => ("OpenAI API", "OpenAI"),
+    let (default_profile, default_recipient) = match (service, mode) {
+        (ProviderService::Ollama, _) => ("Ollama Local", "Local Ollama"),
+        (ProviderService::ClaudeCode, _) => ("Claude Code", "Claude Code"),
+        (ProviderService::ChatGpt, ExecutionMode::ExternalManual) => {
+            ("ChatGPT Conversation", "ChatGPT")
+        }
+        (ProviderService::ChatGpt, _) => ("ChatGPT API", "ChatGPT"),
+        (ProviderService::OpenAiApi, _) => ("OpenAI API", "OpenAI"),
     };
     profile_name.setStringValue(&NSString::from_str(default_profile));
     recipient_name.setStringValue(&NSString::from_str(default_recipient));
@@ -1885,7 +3575,7 @@ fn create_provider_and_recipient(store: &FeltDbWorkStore) {
         mtm,
         &fields,
         62.0,
-        if service == ProviderService::ChatGpt {
+        if service == ProviderService::ChatGpt && mode == ExecutionMode::ExternalManual {
             "External conversation label (optional)"
         } else {
             "Model"
@@ -1910,21 +3600,29 @@ fn create_provider_and_recipient(store: &FeltDbWorkStore) {
         NSSecureTextField::alloc(mtm),
         NSRect::new(NSPoint::new(0.0, 2.0), NSSize::new(380.0, 24.0)),
     );
-    credential.setPlaceholderString(Some(&NSString::from_str(
-        if service == ProviderService::OpenAiApi {
-            "OpenAI API key"
-        } else {
-            "No credential required"
-        },
-    )));
-    credential.setEnabled(service == ProviderService::OpenAiApi);
+    credential.setPlaceholderString(Some(&NSString::from_str(match (service, mode) {
+        (ProviderService::ChatGpt | ProviderService::OpenAiApi, ExecutionMode::HttpApi) => {
+            "OpenAI API key · stored only in Keychain"
+        }
+        (ProviderService::ClaudeCode, _) => "Uses Claude CLI account",
+        (ProviderService::ChatGpt, _) => "Uses browser sign-in · manual transfer",
+        (ProviderService::Ollama, _) => "No sign-in required",
+        _ => "No credential required",
+    })));
+    credential.setEnabled(api_credential);
     fields.addSubview(&credential);
     alert.setAccessoryView(Some(&fields));
     alert.addButtonWithTitle(&NSString::from_str("Save"));
     alert.addButtonWithTitle(&NSString::from_str("Save & Test"));
+    if service == ProviderService::ClaudeCode {
+        alert.addButtonWithTitle(&NSString::from_str("Sign In in Terminal…"));
+    }
     alert.addButtonWithTitle(&NSString::from_str("Cancel"));
     let response = alert.runModal();
-    if response != NSAlertFirstButtonReturn && response != NSAlertFirstButtonReturn + 1 {
+    let sign_in =
+        service == ProviderService::ClaudeCode && response == NSAlertFirstButtonReturn + 2;
+    if response != NSAlertFirstButtonReturn && response != NSAlertFirstButtonReturn + 1 && !sign_in
+    {
         return;
     }
     let profile_name = profile_name.stringValue().to_string();
@@ -1938,13 +3636,13 @@ fn create_provider_and_recipient(store: &FeltDbWorkStore) {
     }
     if matches!(
         service,
-        ProviderService::Ollama | ProviderService::OpenAiApi
+        ProviderService::Ollama | ProviderService::OpenAiApi | ProviderService::ChatGpt
     ) && model_value.trim().is_empty()
     {
         show_work_error("This provider requires an explicit model.");
         return;
     }
-    if service == ProviderService::OpenAiApi && key.is_empty() {
+    if api_credential && key.is_empty() {
         show_work_error("OpenAI API credential is not configured.");
         return;
     }
@@ -2004,6 +3702,9 @@ fn create_provider_and_recipient(store: &FeltDbWorkStore) {
     if let Some(id) = STATE.with(|state| state.borrow().as_ref()?.selected_work.clone()) {
         dismiss_work_overview();
         open_work_overview(&id);
+    }
+    if sign_in {
+        run_in_focused_terminal("claude auth login");
     }
 }
 
@@ -2083,11 +3784,12 @@ fn test_profile_in_ui(store: &FeltDbWorkStore, profile: &ProviderProfile) {
     let ollama = OllamaAdapter::new();
     let claude = ClaudeCodeAdapter;
     let chatgpt = ChatGptManualAdapter;
+    let chatgpt_api = ChatGptProvider::new();
     let openai = OpenAiAdapter::new();
     let router = RoutingService::new(
         store,
         &credentials,
-        vec![&ollama, &claude, &chatgpt, &openai],
+        vec![&ollama, &claude, &chatgpt, &chatgpt_api, &openai],
     );
     match router.test_profile(profile) {
         Ok(status) => show_work_message("Connection", &status),
@@ -3331,32 +5033,32 @@ fn rebuild_sidebar() {
             document.addSubview(&empty);
             y += ROW_HEIGHT;
         }
+        let attention_store = FeltDbWorkStore::for_combe().ok();
+        let graph_health = attention_store
+            .as_ref()
+            .and_then(|store| ContextGraphProjector::verify(store).ok());
         for work in &works {
-            let context = FeltDbWorkStore::for_combe()
-                .and_then(|store| store.context(&work.id))
-                .ok();
-            let attention = context.as_ref().is_some_and(|context| {
-                !context.state.active_proposals.is_empty()
-                    || !context.state.failed_executions.is_empty()
-                    || context.executions.iter().any(|execution| {
-                        execution.status != ExecutionStatus::Started
-                            && !context
-                                .execution_reviews
-                                .iter()
-                                .any(|review| review.execution_id == execution.id)
-                    })
-            });
+            let attention_count = attention_store
+                .as_ref()
+                .zip(graph_health.as_ref())
+                .and_then(|(store, health)| {
+                    derive_work_attention_with_health(store, &work.id, health).ok()
+                })
+                .map(|attention| attention.items.len())
+                .unwrap_or(0);
+            let attention = attention_count > 0;
             let status = match work.status {
                 combe_state::WorkStatus::Active => "●",
                 combe_state::WorkStatus::Paused => "◐",
                 combe_state::WorkStatus::Completed => "✓",
                 combe_state::WorkStatus::Archived => "—",
             };
-            let label = format!(
-                "{status}  {}{}",
-                work.title,
-                if attention { "  •" } else { "" }
-            );
+            let attention_label = match attention_count {
+                0 => String::new(),
+                1 => "  1 action".into(),
+                count => format!("  {count} actions"),
+            };
+            let label = format!("{status}  {}{attention_label}", work.title);
             let id = work.id.clone();
             let row = ClickView::new(
                 mtm,
@@ -3897,6 +5599,7 @@ fn layout_chrome() {
                 ),
             ));
             layout_work_overview(state);
+            layout_worktree_inspector(state);
         }
         if !state
             .window

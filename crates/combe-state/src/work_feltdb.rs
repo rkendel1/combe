@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -14,14 +15,591 @@ use crate::work_store::{
     CONTEXT_TURN_LIMIT, EXECUTION_STALE_AFTER_MINUTES,
 };
 use crate::{
-    ArtifactId, AssignmentId, AssignmentStatus, ContributionAcceptance, ContributionKind,
-    ConversationId, ExecutionId, ExecutionReview, ExecutionReviewId, ExecutionStatus, Participant,
-    ParticipantId, ParticipantResult, ProposalId, ProposalReview, ProposalStatus, ProviderProfile,
+    AiContextEvent, AiContextEventData, AiContinuityStore, AiHistoryExcerpt, AiMessage,
+    AiMessageSource, AiParticipant, AiProviderExchange, AiResponseAttempt, AiResponseStatus,
+    ArtifactId, AssignmentId, AssignmentStatus, ChangeObservation, ChatGptHistoryConversation,
+    ChatGptHistoryStore, ChatGptImportResult, ChatGptImportSource, ContextGraphProjection,
+    ContextGraphStore, ContributionAcceptance, ContributionKind, ConversationId, ExecutionId,
+    ExecutionReview, ExecutionReviewId, ExecutionStatus, Participant, ParticipantId,
+    ParticipantResult, ProposalId, ProposalReview, ProposalStatus, ProviderProfile,
     ProviderProfileId, ProviderRegistry, Recipient, RecipientId, Result, ReviewId, ReviewOutcome,
     RoutedProviderResult, StateError, TurnId, TurnKind, TurnOrigin, WORK_CONTEXT_VERSION, Work,
-    WorkArtifact, WorkAssignment, WorkContext, WorkContribution, WorkConversation, WorkDecision,
-    WorkExecution, WorkId, WorkProposal, WorkState, WorkStatus, WorkStore, WorkTurn,
+    WorkArtifact, WorkAssignment, WorkContext, WorkContextFileHint, WorkContribution,
+    WorkConversation, WorkDecision, WorkExecution, WorkId, WorkProposal, WorkState, WorkStatus,
+    WorkStore, WorkTurn,
 };
+
+impl ContextGraphStore for FeltDbWorkStore {
+    fn load_context_graph(&self) -> Result<Option<ContextGraphProjection>> {
+        self.get("context-graph", "v1")
+    }
+
+    fn save_context_graph(&self, projection: &ContextGraphProjection) -> Result<()> {
+        if projection.contract != crate::CONTEXT_GRAPH_CONTRACT
+            || projection.version != crate::CONTEXT_GRAPH_VERSION
+        {
+            return Err(StateError::InvalidEntity(
+                "unsupported context graph contract".into(),
+            ));
+        }
+        self.insert("context-graph", "v1", projection)
+    }
+
+    fn record_change_observation(&self, observation: ChangeObservation) -> Result<()> {
+        if observation.id.trim().is_empty()
+            || observation.repository_id.trim().is_empty()
+            || observation.commit_id.trim().is_empty()
+        {
+            return Err(StateError::InvalidEntity(
+                "invalid change observation".into(),
+            ));
+        }
+        if let Some(existing) =
+            self.get::<ChangeObservation>("change-observation", &observation.id)?
+        {
+            return if existing == observation {
+                Ok(())
+            } else {
+                Err(StateError::InvalidEntity(
+                    "change observation identity already has different content".into(),
+                ))
+            };
+        }
+        let id = observation.id.clone();
+        self.insert("change-observation", &id, observation)?;
+        let _ = self.refresh_context_graph();
+        Ok(())
+    }
+
+    fn change_observations(&self) -> Result<Vec<ChangeObservation>> {
+        let mut observations = self.scan::<ChangeObservation>("change-observation")?;
+        observations.sort_by(|left, right| {
+            left.timestamp
+                .cmp(&right.timestamp)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(observations)
+    }
+}
+
+impl AiContinuityStore for FeltDbWorkStore {
+    fn append_ai_event(&self, event: AiContextEvent) -> Result<()> {
+        if event.id.trim().is_empty() || event.conversation_id.trim().is_empty() {
+            return Err(StateError::InvalidEntity(
+                "invalid AI context event identity".into(),
+            ));
+        }
+        let existing = self.ai_events(&event.conversation_id)?;
+        if existing.is_empty()
+            && !matches!(event.event, AiContextEventData::ConversationCreated { .. })
+        {
+            return Err(StateError::InvalidEntity(
+                "AI conversation must begin with conversation.created".into(),
+            ));
+        }
+        match &event.event {
+            AiContextEventData::MessageCompleted { message_id, .. } => {
+                if !existing.iter().any(|value| {
+                    matches!(
+                        &value.event,
+                        AiContextEventData::MessageCreated { message } if message.id == *message_id
+                    )
+                }) {
+                    return Err(StateError::InvalidEntity(
+                        "message completion references an unknown message".into(),
+                    ));
+                }
+            }
+            AiContextEventData::DecisionRevised { decision_id, .. } => {
+                if !existing.iter().any(|value| {
+                    matches!(
+                        &value.event,
+                        AiContextEventData::DecisionCreated { decision } if decision.id == *decision_id
+                    )
+                }) {
+                    return Err(StateError::InvalidEntity(
+                        "decision revision references an unknown decision".into(),
+                    ));
+                }
+            }
+            AiContextEventData::WorkLinked { work_id } => {
+                self.require_work(work_id)?;
+            }
+            _ => {}
+        }
+        self.atomic(
+            vec![Self::mutation("ai-context-event", &event.id, &event)?],
+            vec![Self::absent("ai-context-event", &event.id)],
+        )?;
+        let _ = self.refresh_context_graph();
+        Ok(())
+    }
+
+    fn ai_events(&self, conversation_id: &str) -> Result<Vec<AiContextEvent>> {
+        let mut values = self
+            .scan::<AiContextEvent>("ai-context-event")?
+            .into_iter()
+            .filter(|event| event.conversation_id == conversation_id)
+            .collect::<Vec<_>>();
+        values.sort_by(|left, right| {
+            left.occurred_at
+                .cmp(&right.occurred_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(values)
+    }
+
+    fn ai_conversation_ids(&self) -> Result<Vec<String>> {
+        let mut values = self
+            .scan::<AiContextEvent>("ai-context-event")?
+            .into_iter()
+            .filter_map(|event| {
+                matches!(event.event, AiContextEventData::ConversationCreated { .. })
+                    .then_some(event.conversation_id)
+            })
+            .collect::<Vec<_>>();
+        values.sort();
+        values.dedup();
+        Ok(values)
+    }
+
+    fn record_ai_exchange(&self, exchange: AiProviderExchange) -> Result<()> {
+        if exchange.id.trim().is_empty()
+            || exchange.context_fingerprint.trim().is_empty()
+            || exchange.provider.trim().is_empty()
+        {
+            return Err(StateError::InvalidEntity(
+                "invalid provider exchange".into(),
+            ));
+        }
+        let events = self.ai_events(&exchange.conversation_id)?;
+        for message_id in [&exchange.input_message_id, &exchange.output_message_id] {
+            if !events.iter().any(|event| {
+                matches!(
+                    &event.event,
+                    AiContextEventData::MessageCreated { message } if message.id == *message_id
+                )
+            }) {
+                return Err(StateError::InvalidEntity(format!(
+                    "provider exchange references unknown message {message_id}"
+                )));
+            }
+        }
+        self.atomic(
+            vec![Self::mutation(
+                "ai-provider-exchange",
+                &exchange.id,
+                &exchange,
+            )?],
+            vec![Self::absent("ai-provider-exchange", &exchange.id)],
+        )?;
+        let _ = self.refresh_context_graph();
+        Ok(())
+    }
+
+    fn ai_exchanges(&self, conversation_id: &str) -> Result<Vec<AiProviderExchange>> {
+        let mut values = self
+            .scan::<AiProviderExchange>("ai-provider-exchange")?
+            .into_iter()
+            .filter(|exchange| exchange.conversation_id == conversation_id)
+            .collect::<Vec<_>>();
+        values.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(values)
+    }
+
+    fn record_ai_attempt(&self, attempt: AiResponseAttempt) -> Result<()> {
+        if attempt.id.trim().is_empty()
+            || attempt.provider.trim().is_empty()
+            || attempt.service.trim().is_empty()
+            || attempt.context_fingerprint.trim().is_empty()
+            || attempt.status != AiResponseStatus::Started
+        {
+            return Err(StateError::InvalidEntity("invalid provider attempt".into()));
+        }
+        let events = self.ai_events(&attempt.conversation_id)?;
+        if !events.iter().any(|event| {
+            matches!(
+                &event.event,
+                AiContextEventData::MessageCreated { message }
+                    if message.id == attempt.input_message_id
+            )
+        }) {
+            return Err(StateError::InvalidEntity(
+                "provider attempt references an unknown input message".into(),
+            ));
+        }
+        self.atomic(
+            vec![Self::mutation(
+                "ai-response-attempt",
+                &attempt.id,
+                &attempt,
+            )?],
+            vec![Self::absent("ai-response-attempt", &attempt.id)],
+        )
+    }
+
+    fn update_ai_attempt(&self, attempt: AiResponseAttempt) -> Result<()> {
+        let version = self.version("ai-response-attempt", &attempt.id)?;
+        self.atomic(
+            vec![Self::mutation(
+                "ai-response-attempt",
+                &attempt.id,
+                &attempt,
+            )?],
+            vec![Self::at_version(
+                "ai-response-attempt",
+                &attempt.id,
+                version,
+            )],
+        )
+    }
+
+    fn ai_attempts(&self, conversation_id: &str) -> Result<Vec<AiResponseAttempt>> {
+        let mut values = self
+            .scan::<AiResponseAttempt>("ai-response-attempt")?
+            .into_iter()
+            .filter(|attempt| attempt.conversation_id == conversation_id)
+            .collect::<Vec<_>>();
+        values.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        Ok(values)
+    }
+
+    fn relevant_ai_history(
+        &self,
+        conversation_id: &str,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<AiHistoryExcerpt>> {
+        let terms = query
+            .split(|character: char| !character.is_alphanumeric())
+            .map(str::to_lowercase)
+            .filter(|term| term.len() >= 4)
+            .filter(|term| {
+                !matches!(
+                    term.as_str(),
+                    "this"
+                        | "that"
+                        | "with"
+                        | "from"
+                        | "have"
+                        | "work"
+                        | "into"
+                        | "should"
+                        | "about"
+                        | "what"
+                        | "when"
+                        | "where"
+                        | "will"
+                        | "your"
+                        | "they"
+                        | "their"
+                        | "there"
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        if terms.is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut matches = self
+            .scan::<AiContextEvent>("ai-context-event")?
+            .into_iter()
+            .filter_map(|event| {
+                let AiContextEventData::MessageCreated { message } = event.event else {
+                    return None;
+                };
+                let source = message.source.as_ref()?;
+                if event.conversation_id == conversation_id || source.source != "chatgpt_export" {
+                    return None;
+                }
+                let content = message.content.to_lowercase();
+                let score = terms.iter().filter(|term| content.contains(*term)).count();
+                (score >= 2).then(|| {
+                    let excerpt = message.content.chars().take(1200).collect::<String>();
+                    (
+                        score,
+                        AiHistoryExcerpt {
+                            conversation_id: event.conversation_id,
+                            message_id: Some(message.id),
+                            excerpt,
+                            relevance: format!("{score} matching context terms"),
+                            created_at: message.created_at,
+                        },
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| right.1.created_at.cmp(&left.1.created_at))
+                .then_with(|| left.1.conversation_id.cmp(&right.1.conversation_id))
+        });
+        matches.truncate(limit);
+        Ok(matches.into_iter().map(|(_, value)| value).collect())
+    }
+}
+
+impl ChatGptHistoryStore for FeltDbWorkStore {
+    fn import_chatgpt_source(
+        &self,
+        mut source: ChatGptImportSource,
+        conversations: Vec<ChatGptHistoryConversation>,
+    ) -> Result<ChatGptImportResult> {
+        if source.id.trim().is_empty()
+            || source.fingerprint.trim().is_empty()
+            || source.provenance != "chatgpt_export"
+        {
+            return Err(StateError::InvalidEntity(
+                "invalid ChatGPT import source".into(),
+            ));
+        }
+        if conversations
+            .iter()
+            .any(|value| value.source_id != source.id)
+        {
+            return Err(StateError::InvalidEntity(
+                "ChatGPT conversation provenance does not match its import source".into(),
+            ));
+        }
+        if self
+            .get::<ChatGptImportSource>("chatgpt-import-source", &source.id)?
+            .is_none()
+        {
+            self.atomic(
+                vec![Self::mutation(
+                    "chatgpt-import-source",
+                    &source.id,
+                    &source,
+                )?],
+                vec![Self::absent("chatgpt-import-source", &source.id)],
+            )?;
+        }
+        let mut result = ChatGptImportResult::default();
+        for mut conversation in conversations {
+            let key = conversation.conversation_id.clone();
+            let existing = self.get::<ChatGptHistoryConversation>("chatgpt-history", &key)?;
+            if existing
+                .as_ref()
+                .is_some_and(|value| value.fingerprint == conversation.fingerprint)
+            {
+                result.duplicate_conversations += 1;
+                continue;
+            }
+            let canonical_id = format!("chatgpt:{}", conversation.conversation_id);
+            let events = self.ai_events(&canonical_id)?;
+            if events.is_empty() {
+                self.append_ai_event(crate::new_ai_event(
+                    &canonical_id,
+                    AiContextEventData::ConversationCreated {
+                        participants: vec![AiParticipant {
+                            id: "chatgpt".into(),
+                            name: "ChatGPT".into(),
+                            role: "provider".into(),
+                        }],
+                        summary: conversation
+                            .title
+                            .clone()
+                            .unwrap_or_else(|| "Imported ChatGPT conversation".into()),
+                    },
+                ))?;
+                result.new_conversations += 1;
+            } else {
+                result.updated_conversations += 1;
+            }
+            let known_messages = events
+                .iter()
+                .filter_map(|event| match &event.event {
+                    AiContextEventData::MessageCreated { message } => Some(message.id.as_str()),
+                    _ => None,
+                })
+                .collect::<std::collections::BTreeSet<_>>();
+            let mut merged = existing
+                .as_ref()
+                .map(|value| value.messages.clone())
+                .unwrap_or_default();
+            let mut known_source_messages = merged
+                .iter()
+                .map(|message| message.id.clone())
+                .collect::<std::collections::BTreeSet<_>>();
+            for message in &conversation.messages {
+                let message_id = format!("chatgpt:{}:{}", conversation.conversation_id, message.id);
+                if known_messages.contains(message_id.as_str()) {
+                    continue;
+                }
+                let created_at = message.created_at.unwrap_or(source.imported_at);
+                let attachment_references = message
+                    .attachments
+                    .iter()
+                    .filter_map(|attachment| attachment.id.clone().or(attachment.name.clone()))
+                    .collect();
+                let canonical = AiMessage {
+                    id: message_id.clone(),
+                    participant_id: "chatgpt".into(),
+                    role: message.role.clone().unwrap_or_else(|| "unknown".into()),
+                    content: message.content.clone(),
+                    created_at,
+                    completed_at: Some(created_at),
+                    source: Some(AiMessageSource {
+                        source: "chatgpt_export".into(),
+                        import_id: source.id.clone(),
+                        source_conversation_id: conversation.conversation_id.clone(),
+                        source_message_id: message.id.clone(),
+                        source_timestamp: message.created_at,
+                        imported_at: source.imported_at,
+                        parent_message_id: message.parent_id.clone(),
+                        child_message_ids: message.child_ids.clone(),
+                        attachment_references,
+                    }),
+                };
+                self.append_ai_event(crate::new_ai_event(
+                    &canonical_id,
+                    AiContextEventData::MessageCreated { message: canonical },
+                ))?;
+                self.append_ai_event(crate::new_ai_event(
+                    &canonical_id,
+                    AiContextEventData::MessageCompleted {
+                        message_id,
+                        content: message.content.clone(),
+                        completed_at: created_at,
+                    },
+                ))?;
+                result.new_messages += 1;
+                if known_source_messages.insert(message.id.clone()) {
+                    merged.push(message.clone());
+                }
+            }
+            self.append_ai_event(crate::new_ai_event(
+                &canonical_id,
+                AiContextEventData::ContinuityImported {
+                    context_fingerprint: conversation.fingerprint.clone(),
+                    source: "chatgpt_export".into(),
+                    import_id: Some(source.id.clone()),
+                    source_conversation_id: Some(conversation.conversation_id.clone()),
+                    source_created_at: conversation.created_at,
+                    source_updated_at: conversation.updated_at,
+                    source_metadata: conversation.source_metadata.clone(),
+                },
+            ))?;
+            conversation.messages = merged;
+            self.insert("chatgpt-history", &key, conversation)?;
+        }
+        source.conversation_count = self.chatgpt_conversations(Some(&source.id))?.len();
+        let source_id = source.id.clone();
+        self.insert("chatgpt-import-source", &source_id, source)?;
+        Ok(result)
+    }
+
+    fn chatgpt_sources(&self) -> Result<Vec<ChatGptImportSource>> {
+        let mut values = self.scan::<ChatGptImportSource>("chatgpt-import-source")?;
+        values.sort_by_key(|value| Reverse(value.imported_at));
+        Ok(values)
+    }
+
+    fn chatgpt_conversations(
+        &self,
+        source_id: Option<&str>,
+    ) -> Result<Vec<ChatGptHistoryConversation>> {
+        let mut values = self.scan::<ChatGptHistoryConversation>("chatgpt-history")?;
+        if let Some(source_id) = source_id {
+            values.retain(|value| value.source_id == source_id);
+        }
+        values.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.conversation_id.cmp(&right.conversation_id))
+        });
+        Ok(values)
+    }
+
+    fn delete_chatgpt_source(&self, source_id: &str) -> Result<()> {
+        self.get::<ChatGptImportSource>("chatgpt-import-source", source_id)?
+            .ok_or_else(|| StateError::NotFound {
+                entity_type: "chatgpt-import-source".into(),
+                id: source_id.into(),
+            })?;
+        let events = self.scan::<AiContextEvent>("ai-context-event")?;
+        let message_ids = events
+            .iter()
+            .filter_map(|event| match &event.event {
+                AiContextEventData::MessageCreated { message }
+                    if message
+                        .source
+                        .as_ref()
+                        .is_some_and(|source| source.import_id == source_id) =>
+                {
+                    Some(message.id.clone())
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut affected = std::collections::BTreeSet::new();
+        for event in events {
+            let remove = match &event.event {
+                AiContextEventData::MessageCreated { message } => message_ids.contains(&message.id),
+                AiContextEventData::MessageCompleted { message_id, .. } => {
+                    message_ids.contains(message_id)
+                }
+                AiContextEventData::ContinuityImported { import_id, .. } => {
+                    import_id.as_deref() == Some(source_id)
+                }
+                _ => false,
+            };
+            if remove {
+                affected.insert(event.conversation_id);
+                self.db
+                    .delete(&Self::key("ai-context-event", &event.id))
+                    .map_err(|error| StateError::FeltDbError(error.to_string()))?;
+            }
+        }
+        for conversation_id in affected {
+            let remaining = self.ai_events(&conversation_id)?;
+            if let Some(remaining_source_id) =
+                remaining.iter().find_map(|event| match &event.event {
+                    AiContextEventData::MessageCreated { message } => message
+                        .source
+                        .as_ref()
+                        .map(|source| source.import_id.clone()),
+                    _ => None,
+                })
+            {
+                let source_conversation_id = conversation_id
+                    .strip_prefix("chatgpt:")
+                    .unwrap_or(&conversation_id);
+                if let Some(mut conversation) = self
+                    .get::<ChatGptHistoryConversation>("chatgpt-history", source_conversation_id)?
+                {
+                    conversation.source_id = remaining_source_id;
+                    self.insert("chatgpt-history", source_conversation_id, conversation)?;
+                }
+                continue;
+            }
+            for event in remaining {
+                self.db
+                    .delete(&Self::key("ai-context-event", &event.id))
+                    .map_err(|error| StateError::FeltDbError(error.to_string()))?;
+            }
+            let source_conversation_id = conversation_id
+                .strip_prefix("chatgpt:")
+                .unwrap_or(&conversation_id);
+            self.db
+                .delete(&Self::key("chatgpt-history", source_conversation_id))
+                .map_err(|error| StateError::FeltDbError(error.to_string()))?;
+        }
+        self.db
+            .delete(&Self::key("chatgpt-import-source", source_id))
+            .map_err(|error| StateError::FeltDbError(error.to_string()))
+    }
+}
 
 pub struct FeltDbWorkStore {
     db: feltdb::FeltDb,
@@ -207,6 +785,14 @@ impl FeltDbWorkStore {
 
     pub fn for_combe() -> Result<Self> {
         Self::new()
+    }
+
+    fn refresh_context_graph(&self) -> Result<()> {
+        if self.load_context_graph()?.is_some() {
+            let projection = crate::ContextGraphProjector::build(self)?;
+            self.save_context_graph(&projection)?;
+        }
+        Ok(())
     }
 
     fn database_path() -> Result<PathBuf> {
@@ -397,7 +983,9 @@ impl WorkStore for FeltDbWorkStore {
             )?);
             preconditions.push(Self::absent("participant", &participant.id.0));
         }
-        self.atomic(mutations, preconditions)
+        self.atomic(mutations, preconditions)?;
+        let _ = self.refresh_context_graph();
+        Ok(())
     }
 
     fn load_work(&self, id: &WorkId) -> Result<Option<Work>> {
@@ -426,6 +1014,7 @@ impl WorkStore for FeltDbWorkStore {
         work.status = status;
         work.updated_at = Utc::now();
         self.insert("work", &id.0, &work)?;
+        let _ = self.refresh_context_graph();
         Ok(work)
     }
 
@@ -525,7 +1114,9 @@ impl WorkStore for FeltDbWorkStore {
             mutations.push(Self::mutation("turn", &turn.id.0, &turn)?);
             preconditions.push(Self::absent("turn", &turn.id.0));
         }
-        self.atomic(mutations, preconditions)
+        self.atomic(mutations, preconditions)?;
+        let _ = self.refresh_context_graph();
+        Ok(())
     }
 
     fn decisions(&self, work_id: &WorkId) -> Result<Vec<WorkDecision>> {
@@ -542,7 +1133,9 @@ impl WorkStore for FeltDbWorkStore {
     fn add_artifact(&self, artifact: WorkArtifact) -> Result<()> {
         self.require_work(&artifact.work_id)?;
         self.validate_participant(&artifact.work_id, &artifact.created_by)?;
-        self.insert("artifact", &artifact.id.0, &artifact)
+        self.insert("artifact", &artifact.id.0, &artifact)?;
+        let _ = self.refresh_context_graph();
+        Ok(())
     }
 
     fn artifacts(&self, work_id: &WorkId) -> Result<Vec<WorkArtifact>> {
@@ -553,6 +1146,30 @@ impl WorkStore for FeltDbWorkStore {
                 .cmp(&right.created_at)
                 .then_with(|| left.id.0.cmp(&right.id.0))
         });
+        Ok(values)
+    }
+
+    fn set_context_file_hint(&self, hint: WorkContextFileHint) -> Result<()> {
+        self.require_work(&hint.work_id)?;
+        let path = std::path::Path::new(&hint.path);
+        if path.is_absolute()
+            || hint.path.trim().is_empty()
+            || hint.path.split('/').any(|part| part == "..")
+        {
+            return Err(StateError::InvalidEntity(
+                "context file hint must be a relative Worktree path".into(),
+            ));
+        }
+        let id = format!("{}:{}", hint.work_id.0, hint.path);
+        self.insert("context-file-hint", &id, hint)?;
+        let _ = self.refresh_context_graph();
+        Ok(())
+    }
+
+    fn context_file_hints(&self, work_id: &WorkId) -> Result<Vec<WorkContextFileHint>> {
+        let mut values: Vec<WorkContextFileHint> = self.scan("context-file-hint")?;
+        values.retain(|value| value.work_id == *work_id);
+        values.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(values)
     }
 
@@ -782,7 +1399,9 @@ impl WorkStore for FeltDbWorkStore {
                 &conversation,
             )?],
             vec![Self::absent("work-conversation", &conversation.id.0)],
-        )
+        )?;
+        let _ = self.refresh_context_graph();
+        Ok(())
     }
 
     fn import_contribution(&self, conversation: WorkConversation, turn: WorkTurn) -> Result<()> {
@@ -937,6 +1556,7 @@ impl WorkStore for FeltDbWorkStore {
             preconditions.push(Self::absent("decision", &decision.id.0));
         }
         self.atomic(mutations, preconditions)?;
+        let _ = self.refresh_context_graph();
         Ok((proposal, decision))
     }
 
@@ -1475,7 +2095,9 @@ fn bounded(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::{
-        ArtifactKind, ConversationProvider, ConversationRef, DecisionId, ParticipantKind, TurnKind,
+        AiMessage, AiParticipant, ArtifactKind, ChatGptHistoryMessage, ConversationProvider,
+        ConversationRef, DecisionId, ParticipantKind, ResolveConversationOptions, TurnKind,
+        new_ai_event, resolve_conversation_context,
     };
     use tempfile::TempDir;
 
@@ -2541,5 +3163,207 @@ mod tests {
                 .unwrap();
             assert!(matches!(accepted, ContributionAcceptance::Turn(_)));
         }
+    }
+
+    #[test]
+    fn chatgpt_history_is_canonical_incremental_relevant_and_idempotent() {
+        let (store, _directory) = store();
+        let source = ChatGptImportSource {
+            id: "export-fingerprint".into(),
+            provenance: "chatgpt_export".into(),
+            display_name: "chatgpt-export.zip".into(),
+            imported_at: Utc::now(),
+            conversation_count: 1,
+            fingerprint: "export-fingerprint".into(),
+        };
+        let first_message = ChatGptHistoryMessage {
+            id: "message-1".into(),
+            parent_id: None,
+            child_ids: vec!["message-2".into()],
+            role: Some("assistant".into()),
+            created_at: Some(Utc::now()),
+            content: "Combe should own canonical AI context and provider continuity.".into(),
+            attachments: Vec::new(),
+            fingerprint: "message-one-fingerprint".into(),
+        };
+        let conversation = ChatGptHistoryConversation {
+            source_id: source.id.clone(),
+            conversation_id: "chat-1".into(),
+            title: Some("Architecture".into()),
+            created_at: None,
+            updated_at: None,
+            messages: vec![first_message.clone()],
+            source_metadata: Default::default(),
+            fingerprint: "conversation-fingerprint".into(),
+        };
+        let first = store
+            .import_chatgpt_source(source.clone(), vec![conversation.clone()])
+            .unwrap();
+        assert_eq!(first.new_conversations, 1);
+        assert_eq!(first.new_messages, 1);
+        let duplicate = store
+            .import_chatgpt_source(source.clone(), vec![conversation])
+            .unwrap();
+        assert_eq!(duplicate.duplicate_conversations, 1);
+        assert_eq!(duplicate.new_messages, 0);
+        let later_source = ChatGptImportSource {
+            id: "later-export".into(),
+            fingerprint: "later-export".into(),
+            ..source
+        };
+        let incremental = store
+            .import_chatgpt_source(
+                later_source,
+                vec![ChatGptHistoryConversation {
+                    source_id: "later-export".into(),
+                    conversation_id: "chat-1".into(),
+                    title: Some("Architecture".into()),
+                    created_at: None,
+                    updated_at: None,
+                    messages: vec![
+                        first_message,
+                        ChatGptHistoryMessage {
+                            id: "message-2".into(),
+                            parent_id: Some("message-1".into()),
+                            child_ids: Vec::new(),
+                            role: Some("user".into()),
+                            created_at: Some(Utc::now()),
+                            content: "Keep the resolver bounded and relevant.".into(),
+                            attachments: Vec::new(),
+                            fingerprint: "message-two-fingerprint".into(),
+                        },
+                    ],
+                    source_metadata: Default::default(),
+                    fingerprint: "expanded-conversation-fingerprint".into(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(incremental.updated_conversations, 1);
+        assert_eq!(incremental.new_messages, 1);
+        assert_eq!(store.chatgpt_sources().unwrap().len(), 2);
+        assert_eq!(store.chatgpt_conversations(None).unwrap().len(), 1);
+        let canonical = store.ai_events("chatgpt:chat-1").unwrap();
+        let imported = canonical
+            .iter()
+            .filter_map(|event| match &event.event {
+                AiContextEventData::MessageCreated { message } => message.source.as_ref(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(imported.len(), 2);
+        assert!(
+            imported
+                .iter()
+                .all(|value| value.source == "chatgpt_export")
+        );
+        assert_eq!(imported[0].source_conversation_id, "chat-1");
+        store
+            .append_ai_event(new_ai_event(
+                "combe:current",
+                AiContextEventData::ConversationCreated {
+                    participants: Vec::new(),
+                    summary: "Decide canonical AI context architecture".into(),
+                },
+            ))
+            .unwrap();
+        let context = resolve_conversation_context(
+            &store,
+            "combe:current",
+            ResolveConversationOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(context.relevant_history.len(), 1);
+        assert_eq!(
+            context.relevant_history[0].conversation_id,
+            "chatgpt:chat-1"
+        );
+        store.delete_chatgpt_source("later-export").unwrap();
+        assert_eq!(
+            store
+                .ai_events("chatgpt:chat-1")
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(&event.event, AiContextEventData::MessageCreated { .. }))
+                .count(),
+            1
+        );
+        store.delete_chatgpt_source("export-fingerprint").unwrap();
+        assert!(store.ai_events("chatgpt:chat-1").unwrap().is_empty());
+        assert!(store.chatgpt_conversations(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn ai_context_is_deterministic_bounded_and_changes_with_conversation_state() {
+        let (store, _directory) = store();
+        let (work, human, _agent) = work_with_participants(&store);
+        let conversation_id = format!("work:{}", work.id.0);
+        store
+            .append_ai_event(new_ai_event(
+                &conversation_id,
+                AiContextEventData::ConversationCreated {
+                    participants: vec![AiParticipant {
+                        id: human.id.0.clone(),
+                        name: human.name.clone(),
+                        role: "human".into(),
+                    }],
+                    summary: "Durable continuity".into(),
+                },
+            ))
+            .unwrap();
+        store
+            .append_ai_event(new_ai_event(
+                &conversation_id,
+                AiContextEventData::WorkLinked {
+                    work_id: work.id.clone(),
+                },
+            ))
+            .unwrap();
+        for index in 0..3 {
+            let message_id = format!("message-{index}");
+            store
+                .append_ai_event(new_ai_event(
+                    &conversation_id,
+                    AiContextEventData::MessageCreated {
+                        message: AiMessage {
+                            id: message_id.clone(),
+                            participant_id: human.id.0.clone(),
+                            role: "user".into(),
+                            content: format!("message {index}"),
+                            created_at: Utc::now(),
+                            completed_at: None,
+                            source: None,
+                        },
+                    },
+                ))
+                .unwrap();
+            store
+                .append_ai_event(new_ai_event(
+                    &conversation_id,
+                    AiContextEventData::MessageCompleted {
+                        message_id,
+                        content: format!("message {index}"),
+                        completed_at: Utc::now(),
+                    },
+                ))
+                .unwrap();
+        }
+        let options = ResolveConversationOptions {
+            provider: Some("ollama".into()),
+            model: Some("local".into()),
+            recent_message_limit: 2,
+            ..Default::default()
+        };
+        let first =
+            resolve_conversation_context(&store, &conversation_id, options.clone()).unwrap();
+        let second = resolve_conversation_context(&store, &conversation_id, options).unwrap();
+        assert_eq!(
+            first.canonical_json().unwrap(),
+            second.canonical_json().unwrap()
+        );
+        assert_eq!(first.recent_messages.len(), 2);
+        assert_eq!(first.recent_messages[0].content, "message 1");
+        assert_eq!(first.work_id, Some(work.id));
+        assert!(!first.work_state.is_empty());
+        assert_eq!(first.context_fingerprint.len(), 64);
     }
 }

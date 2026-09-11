@@ -1,4 +1,6 @@
-use combe_state::{FileWorkspaceStore, Pane, Tab, Workspace, WorkspaceKind, WorkspaceState, WorkspaceStore, Result};
+use combe_state::{
+    FileWorkspaceStore, Pane, Result, Tab, Workspace, WorkspaceKind, WorkspaceState, WorkspaceStore,
+};
 use std::sync::{Arc, Mutex};
 
 pub struct SessionManager {

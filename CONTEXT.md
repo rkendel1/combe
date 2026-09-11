@@ -47,10 +47,18 @@ Use these words in code, commits, and docs. If a new domain word sticks, add it 
 | Execution review | A durable participant evaluation anchored to one Execution and its Assignment. |
 | Work surface | The native projection and explicit controls for one Work's coordination, routed messages, activity, artifacts, and execution environment. It owns no durable state. |
 | Work activity | A bounded deterministic timeline derived from existing Work records. It is not an event store. |
+| Work attention | A deterministic read-only projection of outstanding obligations from explicit durable Work and graph state. It is not a queue, agent, or persisted workflow. |
 | Recipient | The explicit destination of a routed Work message. It references one Provider profile and is never inferred from UI history. |
 | Provider profile | Durable, non-secret configuration describing a service, model, capabilities, execution mode, endpoint, and optional Keychain credential reference. |
 | Provider adapter | A service-specific transport behind the provider-neutral Message router. |
 | Message router | Resolves one explicit Recipient and Provider profile, preserves the Work's worktree, invokes exactly one adapter, and records provenance without fallback. |
 | Credential reference | A non-secret stable name persisted in a Provider profile. The referenced credential exists only in macOS Keychain. |
+| ChatGPT import source | One locally acquired official ChatGPT export, identified by a content fingerprint. Raw export bytes are never persisted by Combe. |
+| Imported conversation | Canonical AI conversation events acquired from a ChatGPT export with original identity, branches, timestamps, attachment metadata, and provenance. The ChatGPT-specific index exists only for reconciliation and management. |
+| AI conversation | Provider-neutral durable continuity identified independently of any provider transcript. |
+| AI context | One deterministic, bounded `COMBE_AI_CONTEXT` projection resolved from canonical conversation events and linked Work state. |
+| Provider exchange | Provenance linking provider/model input and output message identities to the exact AI context fingerprint supplied to the provider. |
+| Context package | One deterministic, bounded projection of a Work-scoped Context Graph for an explicit message and Recipient. It is inspected and sent, never stored as another authority. |
+| Context item | One stable provider-neutral entry in a Context package, with provenance, rank, human-readable selection reasons, and optional bounded content. A File Context item always retains its reference and explicitly states whether content was included, reference-only, excluded, or unavailable. |
 
 Out of vocabulary: agent session, workbench, desk, execution host, orcad, theme, preference pane.
