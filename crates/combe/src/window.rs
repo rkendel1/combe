@@ -35,7 +35,10 @@ use crate::split;
 use crate::surface::SurfaceView;
 use crate::tabs::Tabs;
 use crate::work_overview;
-use combe_state::{FeltDbWorkStore, ParticipantKind, WorkContext, WorkId, WorkStore};
+use combe_state::{
+    ConversationProvider, FeltDbWorkStore, ParticipantKind, ProposalStatus, WorkContext, WorkId,
+    WorkStore,
+};
 
 const ROW_HEIGHT: f64 = 36.0;
 const HEADER_HEIGHT: f64 = 30.0;
@@ -995,7 +998,24 @@ fn open_work_overview(id: &WorkId) {
         let handoff_id = id.clone();
         let handoff = (!handoff_options(&context).is_empty())
             .then(|| Box::new(move || choose_handoff(&handoff_id)) as Box<dyn Fn()>);
-        let view = work_overview::new(mtm, state.content.bounds(), &context, handoff);
+        let export_id = id.clone();
+        let import_id = id.clone();
+        let new_proposal_id = id.clone();
+        let review_id = id.clone();
+        let approve_id = id.clone();
+        let reject_id = id.clone();
+        let assign_id = id.clone();
+        let actions = work_overview::Actions {
+            new_proposal: Box::new(move || new_work_proposal(&new_proposal_id)),
+            review: Box::new(move || proposal_action(&review_id, "request-changes")),
+            approve: Box::new(move || proposal_action(&approve_id, "approve")),
+            reject: Box::new(move || proposal_action(&reject_id, "reject")),
+            assign: Box::new(move || assign_proposal(&assign_id)),
+            export: Box::new(move || export_work_context(&export_id)),
+            import: Box::new(move || import_work_contribution(&import_id)),
+            handoff,
+        };
+        let view = work_overview::new(mtm, state.content.bounds(), &context, actions);
         state.content.addSubview(&view);
         state.work_overview = Some(view);
         layout_work_overview(state);
@@ -1082,12 +1102,163 @@ fn shell_word(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+fn run_in_focused_terminal(command: &str) {
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(surface) = state
+            .as_ref()
+            .and_then(|state| state.tabs.active()?.focused_surface())
+        {
+            surface.binding_action(&format!("text:{command}"));
+            state
+                .as_ref()
+                .unwrap()
+                .window
+                .makeFirstResponder(Some(&surface));
+        }
+    });
+}
+
+fn export_work_context(id: &WorkId) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    run_in_focused_terminal(&format!(
+        "{} work context {} --format text\r",
+        shell_word(&executable.to_string_lossy()),
+        shell_word(&id.0)
+    ));
+}
+
+fn new_work_proposal(id: &WorkId) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    run_in_focused_terminal(&format!(
+        "pbpaste | {} work proposal create {} --participant Human --title ",
+        shell_word(&executable.to_string_lossy()),
+        shell_word(&id.0)
+    ));
+}
+
+fn choose_proposal(id: &WorkId, status: ProposalStatus, title: &str) -> Option<String> {
+    let proposals = FeltDbWorkStore::for_combe()
+        .and_then(|store| store.proposals(id))
+        .ok()?
+        .into_iter()
+        .filter(|proposal| proposal.status == status)
+        .collect::<Vec<_>>();
+    if proposals.is_empty() {
+        return None;
+    }
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str(title));
+    alert.setInformativeText(&NSString::from_str("Choose a proposal."));
+    for proposal in &proposals {
+        alert.addButtonWithTitle(&NSString::from_str(&proposal.title));
+    }
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let index = usize::try_from(alert.runModal() - NSAlertFirstButtonReturn).ok()?;
+    proposals.get(index).map(|proposal| proposal.id.0.clone())
+}
+
+fn proposal_action(id: &WorkId, action: &str) {
+    let Some(proposal_id) = choose_proposal(id, ProposalStatus::Proposed, "Review Proposal") else {
+        return;
+    };
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    run_in_focused_terminal(&format!(
+        "{} work proposal {} {} --by Human\r",
+        shell_word(&executable.to_string_lossy()),
+        shell_word(action),
+        shell_word(&proposal_id)
+    ));
+}
+
+fn assign_proposal(id: &WorkId) {
+    let Some(proposal_id) = choose_proposal(id, ProposalStatus::Approved, "Assign Proposal") else {
+        return;
+    };
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    run_in_focused_terminal(&format!(
+        "{} work assign {} --to Codex --proposal {} --instruction ",
+        shell_word(&executable.to_string_lossy()),
+        shell_word(&id.0),
+        shell_word(&proposal_id)
+    ));
+}
+
+fn import_work_contribution(id: &WorkId) {
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let conversations = FeltDbWorkStore::for_combe()
+        .and_then(|store| store.context(id))
+        .map(|context| context.conversations)
+        .unwrap_or_default();
+    if conversations.is_empty() {
+        run_in_focused_terminal(&format!(
+            "pbpaste | {} work import {} --participant ChatGPT --provider chatgpt --conversation ",
+            shell_word(&executable.to_string_lossy()),
+            shell_word(&id.0)
+        ));
+        return;
+    }
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Import Contribution"));
+    alert.setInformativeText(&NSString::from_str(
+        "Choose the conversation whose copied response should be imported.",
+    ));
+    for conversation in &conversations {
+        let label = conversation
+            .label
+            .as_deref()
+            .or(conversation.conversation.title.as_deref())
+            .unwrap_or(&conversation.conversation.id);
+        alert.addButtonWithTitle(&NSString::from_str(label));
+    }
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let index = alert.runModal() - NSAlertFirstButtonReturn;
+    let Ok(index) = usize::try_from(index) else {
+        return;
+    };
+    let Some(conversation) = conversations.get(index) else {
+        return;
+    };
+    let participant = FeltDbWorkStore::for_combe()
+        .and_then(|store| store.load_participant(&conversation.participant_id))
+        .ok()
+        .flatten()
+        .map(|participant| participant.name)
+        .unwrap_or_else(|| conversation.participant_id.0.clone());
+    let provider = match &conversation.conversation.provider {
+        ConversationProvider::ChatGpt => "chatgpt",
+        ConversationProvider::Claude => "claude",
+        ConversationProvider::Codex => "codex",
+        ConversationProvider::Other(value) => value,
+    };
+    run_in_focused_terminal(&format!(
+        "pbpaste | {} work import {} --participant {} --provider {} --conversation {}\r",
+        shell_word(&executable.to_string_lossy()),
+        shell_word(&id.0),
+        shell_word(&participant),
+        shell_word(provider),
+        shell_word(&conversation.conversation.id)
+    ));
+}
+
 fn layout_work_overview(state: &State) {
     let Some(view) = state.work_overview.as_ref() else {
         return;
     };
     let bounds = state.content.bounds();
-    let width = bounds.size.width.min(380.0).max(280.0);
+    let width = bounds.size.width.clamp(340.0, 380.0);
     view.setFrame(NSRect::new(
         NSPoint::new(bounds.size.width - width, 0.0),
         NSSize::new(width, bounds.size.height),

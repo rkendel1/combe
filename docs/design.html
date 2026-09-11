@@ -236,7 +236,15 @@
     .work-objective { margin: 18px 0 24px; color: var(--text-soft); line-height: 1.55; }
     .work-overview h2 { margin: 20px 0 8px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
     .work-overview ul { margin: 0; padding-left: 18px; color: var(--text-soft); line-height: 1.55; }
-    .work-handoff { margin-top: 20px; border: 0; border-radius: 8px; padding: 7px 14px; background: var(--selection); color: var(--text-strong); }
+    .work-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 20px; }
+    .work-action { border: 0; border-radius: 8px; padding: 7px 14px; background: var(--selection); color: var(--text-strong); }
+    .proposal-card { margin: 8px 0; padding: 12px; border: .5px solid var(--line); border-radius: 10px; color: var(--text-soft); line-height: 1.45; }
+    .proposal-card strong { display: block; color: var(--text-strong); font-weight: 600; }
+    .proposal-card small { display: block; margin-top: 3px; color: var(--muted); }
+    .conversation-list { list-style: none; padding: 0 !important; }
+    .conversation-list li { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; padding: 7px 0; }
+    .conversation-list small { color: var(--muted); }
+    .conversation-list .turn-count { grid-row: 1 / 3; grid-column: 2; align-self: center; color: var(--muted); font-size: 11px; }
     .work-group { margin-top: 16px; padding-top: 8px; border-top: .5px solid var(--line); }
     .work-row { padding-left: 32px; }
     .work-row .work-state { margin-left: auto; color: var(--green); font-size: 11px; }
@@ -319,7 +327,7 @@
         </aside>
         <section class="right" aria-label="Terminal preview">
           <div class="tabs" id="tabs"></div>
-          <div class="term"><div class="pane" id="left"></div><div class="pane" id="right"></div><article class="work-overview" id="work-overview" aria-label="Work overview" hidden><h1>FeltDB integration</h1><span class="work-status">Active</span><p class="work-objective">Establish durable, provider-neutral context that humans and external agents can continue.</p><button class="work-handoff" id="work-handoff" type="button">Handoff…</button><h2>Participants</h2><ul><li>Randy · Human</li><li>Codex · Agent</li><li>Security reviewer · Agent</li></ul><h2>Active assignments</h2><ul><li>Implement the WorkStore adapter</li></ul><h2>Decisions</h2><ul><li>Use FeltDB directly from Combe</li></ul><h2>Recent turns</h2><ul><li>Architecture accepted</li><li>Implementation in progress</li></ul></article></div>
+          <div class="term"><div class="pane" id="left"></div><div class="pane" id="right"></div><article class="work-overview" id="work-overview" aria-label="Work overview" hidden><h1>AuthPort integration</h1><span class="work-status">● Active</span><p class="work-objective">Move authorization behind a stable port while preserving the provider-neutral Work boundary.</p><div class="work-actions"><button class="work-action" id="work-new-proposal" type="button">New Proposal</button><button class="work-action" id="work-review" type="button">Review</button><button class="work-action" id="work-approve" type="button">Approve</button><button class="work-action" id="work-reject" type="button">Reject</button><button class="work-action" id="work-assign" type="button">Assign</button><button class="work-action" id="work-export" type="button">Export Context</button><button class="work-action" id="work-import" type="button">Import Contribution</button><button class="work-action" id="work-handoff" type="button">Handoff…</button></div><h2>Proposals</h2><div class="proposal-card"><strong>Move authorization into AuthPort</strong>Proposed · ChatGPT<small>Awaiting review</small></div><h2>Approved</h2><div class="proposal-card"><strong>Keep provider adapters outside Work</strong>Approved · Randy<small>Decision recorded</small></div><h2>Executing</h2><ul><li>Codex · Implement the approved AuthPort approach</li></ul><h2>Recent results</h2><ul><li>Codex · Added provider-neutral authorization boundary</li></ul><h2>Conversations</h2><ul class="conversation-list"><li><span>ChatGPT</span><small>Architecture discussion</small><span class="turn-count">2 turns</span></li><li><span>Codex</span><small>Implementation handoff</small><span class="turn-count">3 turns</span></li></ul><h2>Participants</h2><ul><li>Randy · Human</li><li>ChatGPT · Agent</li><li>Codex · Agent</li></ul><h2>Decisions</h2><ul><li>Keep provider adapters outside Work</li></ul></article></div>
           <footer class="status-line" aria-label="Usage status">
             <div class="quota" id="quota">
               <div class="quota-details" id="quota-details" role="region" aria-label="Quota details" tabindex="-1" inert>
@@ -568,6 +576,9 @@
     }
     document.getElementById("component").addEventListener("change", renderTabs);
     document.getElementById("work-handoff").addEventListener("click", () => showToast("Handoff to Codex in this workspace terminal"));
+    document.getElementById("work-export").addEventListener("click", () => showToast("Export Work context in this workspace terminal"));
+    document.getElementById("work-import").addEventListener("click", () => showToast("Import an external contribution in this workspace terminal"));
+    for (const [id, message] of [["work-new-proposal", "Create a proposal in this workspace terminal"], ["work-review", "Review the selected proposal"], ["work-approve", "Approve the selected proposal"], ["work-reject", "Reject the selected proposal"], ["work-assign", "Assign the approved proposal"]]) document.getElementById(id).addEventListener("click", () => showToast(message));
 
     function setMode(next) {
       clearTimeout(menuTimer);

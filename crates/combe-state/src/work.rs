@@ -36,6 +36,9 @@ id!(TurnId);
 id!(AssignmentId);
 id!(DecisionId);
 id!(ArtifactId);
+id!(ConversationId);
+id!(ProposalId);
+id!(ReviewId);
 
 pub type WorkspaceId = String;
 
@@ -113,6 +116,30 @@ pub enum TurnKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationProvider {
+    ChatGpt,
+    Claude,
+    Codex,
+    Other(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationRef {
+    pub id: String,
+    pub provider: ConversationProvider,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOrigin {
+    #[default]
+    Local,
+    ExternalConversation(ConversationRef),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkTurn {
     pub id: TurnId,
     pub work_id: WorkId,
@@ -124,6 +151,63 @@ pub struct WorkTurn {
     pub assignment_id: Option<AssignmentId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_id: Option<String>,
+    #[serde(default)]
+    pub origin: TurnOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkConversation {
+    pub id: ConversationId,
+    pub work_id: WorkId,
+    pub conversation: ConversationRef,
+    pub participant_id: ParticipantId,
+    pub label: Option<String>,
+    pub created_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalStatus {
+    Draft,
+    Proposed,
+    Approved,
+    Rejected,
+    Superseded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkProposal {
+    pub id: ProposalId,
+    pub work_id: WorkId,
+    pub proposed_by: ParticipantId,
+    pub title: String,
+    pub statement: String,
+    pub rationale: Option<String>,
+    pub status: ProposalStatus,
+    #[serde(default)]
+    pub origin: TurnOrigin,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewOutcome {
+    Approve,
+    Reject,
+    RequestChanges,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposalReview {
+    pub id: ReviewId,
+    pub proposal_id: ProposalId,
+    pub reviewed_by: ParticipantId,
+    pub outcome: ReviewOutcome,
+    pub comment: Option<String>,
+    #[serde(default)]
+    pub origin: TurnOrigin,
+    pub created_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,6 +243,8 @@ pub struct WorkAssignment {
     pub instruction: String,
     pub status: AssignmentStatus,
     pub created_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_id: Option<ProposalId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -169,6 +255,10 @@ pub struct WorkDecision {
     pub rationale: Option<String>,
     pub decided_by: ParticipantId,
     pub created_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proposal_id: Option<ProposalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_id: Option<ReviewId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,4 +291,40 @@ pub struct WorkContext {
     pub active_assignments: Vec<WorkAssignment>,
     pub decisions: Vec<WorkDecision>,
     pub artifacts: Vec<WorkArtifact>,
+    pub conversations: Vec<WorkConversation>,
+    #[serde(default)]
+    pub proposals: Vec<WorkProposal>,
+    #[serde(default)]
+    pub reviews: Vec<ProposalReview>,
+    #[serde(default)]
+    pub state: WorkState,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkState {
+    pub active_proposals: Vec<WorkProposal>,
+    pub approved_proposals: Vec<WorkProposal>,
+    pub active_assignments: Vec<WorkAssignment>,
+    pub recent_results: Vec<WorkTurn>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConversationProvider;
+
+    #[test]
+    fn conversation_providers_round_trip_through_json() {
+        for provider in [
+            ConversationProvider::ChatGpt,
+            ConversationProvider::Claude,
+            ConversationProvider::Codex,
+            ConversationProvider::Other("local-model".into()),
+        ] {
+            let json = serde_json::to_string(&provider).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ConversationProvider>(&json).unwrap(),
+                provider
+            );
+        }
+    }
 }

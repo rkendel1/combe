@@ -84,7 +84,7 @@ impl ContextPackage {
         let repository_root = git(path, &["rev-parse", "--show-toplevel"]);
         let branch = git(path, &["branch", "--show-current"]);
         Ok(Self {
-            schema: "combe.work-context.v1".into(),
+            schema: "combe.work-context.v2".into(),
             repository: RepositoryContext {
                 worktree_path,
                 repository_root,
@@ -102,12 +102,12 @@ impl ContextPackage {
     pub fn text(&self) -> String {
         let context = &self.context;
         let mut output = format!(
-            "WORK\nTitle: {}\nObjective: {}\nStatus: {:?}\nWorkspace ID: {}\nWork ID: {}\nWorktree path: {}\nRepository root: {}\nBranch: {}\n",
+            "COMBE_WORK_CONTEXT\nversion: 2\nwork_id: {}\ntitle: {}\nobjective: {}\nstatus: {:?}\nworkspace_id: {}\nworktree_path: {}\nrepository_root: {}\nbranch: {}\n",
+            context.work.id,
             context.work.title,
             context.work.objective.as_deref().unwrap_or(""),
             context.work.status,
             context.work.workspace_id,
-            context.work.id,
             self.repository.worktree_path,
             self.repository.repository_root.as_deref().unwrap_or(""),
             self.repository.branch.as_deref().unwrap_or(""),
@@ -123,6 +123,40 @@ impl ContextPackage {
         } else {
             output.push_str("None\n");
         }
+        output.push_str("\nCURRENT STATE\n");
+        output.push_str(&format!(
+            "Active proposals: {}\nApproved proposals: {}\nActive assignments: {}\nRecent results: {}\n",
+            context.state.active_proposals.len(),
+            context.state.approved_proposals.len(),
+            context.state.active_assignments.len(),
+            context.state.recent_results.len()
+        ));
+        output.push_str("\nPROPOSALS\n");
+        for proposal in &context.proposals {
+            output.push_str(&format!(
+                "- {} [{:?}] by {}: {}\n",
+                proposal.id, proposal.status, proposal.proposed_by, proposal.title
+            ));
+        }
+        output.push_str("\nPENDING REVIEWS\n");
+        for proposal in &context.state.active_proposals {
+            if proposal.status == combe_state::ProposalStatus::Proposed {
+                output.push_str(&format!("- {}: {}\n", proposal.id, proposal.title));
+            }
+        }
+        output.push_str("\nCONVERSATIONS\n");
+        for conversation in &context.conversations {
+            output.push_str(&format!(
+                "- {:?}: {} ({})\n",
+                conversation.conversation.provider,
+                conversation
+                    .label
+                    .as_deref()
+                    .or(conversation.conversation.title.as_deref())
+                    .unwrap_or(&conversation.conversation.id),
+                conversation.conversation.id
+            ));
+        }
         output.push_str("\nCURRENT DECISIONS\n");
         for decision in &context.decisions {
             output.push_str(&format!("- {}\n", decision.statement));
@@ -137,6 +171,10 @@ impl ContextPackage {
         for turn in &context.recent_turns {
             output.push_str(&format!("- {}: {}\n", turn.participant_id, turn.content));
         }
+        output.push_str("\nRECENT RESULTS\n");
+        for turn in &context.state.recent_results {
+            output.push_str(&format!("- {}: {}\n", turn.participant_id, turn.content));
+        }
         output.push_str("\nCONSTRAINTS\n");
         for constraint in &self.constraints {
             output.push_str(&format!("- {constraint}\n"));
@@ -145,7 +183,7 @@ impl ContextPackage {
         if let Some(assignment) = &self.assignment {
             output.push_str(&assignment.instruction);
         }
-        output.push('\n');
+        output.push_str("\n\nEND_COMBE_WORK_CONTEXT\n");
         output
     }
 }
@@ -257,8 +295,10 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use combe_state::{
-        AssignmentId, AssignmentStatus, FeltDbWorkStore, ParticipantId, ParticipantKind,
-        ParticipantResult, TurnId, TurnKind, Work, WorkId, WorkStatus, WorkStore, WorkTurn,
+        AssignmentId, AssignmentStatus, ConversationId, ConversationProvider, ConversationRef,
+        FeltDbWorkStore, ParticipantId, ParticipantKind, ParticipantResult, ProposalId,
+        ProposalReview, ProposalStatus, ReviewId, ReviewOutcome, TurnId, TurnKind, TurnOrigin,
+        Work, WorkConversation, WorkId, WorkProposal, WorkStatus, WorkStore, WorkTurn,
     };
     use tempfile::TempDir;
 
@@ -298,6 +338,7 @@ mod tests {
             instruction: "Do not modify files. Reply exactly COMBE_HANDOFF_OK.".into(),
             status: AssignmentStatus::Pending,
             created_at: Utc::now(),
+            proposal_id: None,
         };
         let context = WorkContext {
             work,
@@ -306,6 +347,15 @@ mod tests {
             active_assignments: vec![assignment.clone()],
             decisions: Vec::new(),
             artifacts: Vec::new(),
+            conversations: Vec::new(),
+            proposals: Vec::new(),
+            reviews: Vec::new(),
+            state: combe_state::WorkState {
+                active_proposals: Vec::new(),
+                approved_proposals: Vec::new(),
+                active_assignments: vec![assignment.clone()],
+                recent_results: Vec::new(),
+            },
         };
         (directory, context, assignment, agent)
     }
@@ -320,8 +370,13 @@ mod tests {
             serde_json::from_str::<ContextPackage>(&json).unwrap(),
             package
         );
-        assert!(json.contains("combe.work-context.v1"));
-        assert!(package.text().contains("Worktree path:"));
+        assert!(json.contains("combe.work-context.v2"));
+        assert!(package.text().starts_with("COMBE_WORK_CONTEXT\nversion: 2"));
+        assert!(package.text().contains("\nCURRENT STATE\n"));
+        assert!(package.text().contains("\nPROPOSALS\n"));
+        assert!(package.text().contains("\nPENDING REVIEWS\n"));
+        assert!(package.text().contains("\nRECENT RESULTS\n"));
+        assert!(package.text().ends_with("END_COMBE_WORK_CONTEXT\n"));
     }
 
     #[test]
@@ -347,21 +402,92 @@ mod tests {
     #[test]
     #[ignore = "runs the installed Codex CLI"]
     fn real_codex_handoff_returns_output() {
-        let (_directory, context, assignment, agent) = fixture();
+        let (_directory, context, mut assignment, agent) = fixture();
         let database = TempDir::new().unwrap();
         let database_path = database.path().join("work.db");
         let store = FeltDbWorkStore::open(&database_path).unwrap();
         store
             .create_work(context.work.clone(), context.participants.clone())
             .unwrap();
+        let chatgpt = Participant::new(
+            context.work.id.clone(),
+            ParticipantKind::Agent,
+            "ChatGPT".into(),
+        );
+        store.add_participant(chatgpt.clone()).unwrap();
+        let reference = ConversationRef {
+            id: "chatgpt-manual-review".into(),
+            provider: ConversationProvider::ChatGpt,
+            title: Some("Manual ChatGPT contribution".into()),
+        };
+        store
+            .import_contribution(
+                WorkConversation {
+                    id: ConversationId::new(),
+                    work_id: context.work.id.clone(),
+                    conversation: reference.clone(),
+                    participant_id: chatgpt.id.clone(),
+                    label: Some("ChatGPT".into()),
+                    created_at: Utc::now(),
+                },
+                WorkTurn {
+                    id: TurnId::new(),
+                    work_id: context.work.id.clone(),
+                    participant_id: chatgpt.id.clone(),
+                    kind: TurnKind::Review,
+                    content: "External review says preserve the provider-neutral boundary.".into(),
+                    created_at: Utc::now(),
+                    assignment_id: None,
+                    execution_id: None,
+                    origin: TurnOrigin::ExternalConversation(reference.clone()),
+                },
+            )
+            .unwrap();
+        let now = Utc::now();
+        let proposal = WorkProposal {
+            id: ProposalId::new(),
+            work_id: context.work.id.clone(),
+            proposed_by: chatgpt.id,
+            title: "Preserve the provider-neutral boundary".into(),
+            statement: "Implement the assigned check without coupling Work to a provider.".into(),
+            rationale: None,
+            status: ProposalStatus::Proposed,
+            origin: TurnOrigin::ExternalConversation(reference),
+            created_at: now,
+            updated_at: now,
+        };
+        store.create_proposal(proposal.clone()).unwrap();
+        store
+            .review_proposal(ProposalReview {
+                id: ReviewId::new(),
+                proposal_id: proposal.id.clone(),
+                reviewed_by: context.participants[0].id.clone(),
+                outcome: ReviewOutcome::Approve,
+                comment: Some("Approved for implementation".into()),
+                origin: TurnOrigin::Local,
+                created_at: Utc::now(),
+            })
+            .unwrap();
+        assignment.proposal_id = Some(proposal.id.clone());
         store.add_assignment(assignment.clone()).unwrap();
-        let mut assignment = store
+        assignment = store
             .set_assignment_status(&assignment.id, AssignmentStatus::Active)
             .unwrap();
         let adapter = LocalCliAdapter::discover(LocalProvider::Codex).unwrap();
         let prepared = adapter
-            .prepare(context, assignment.clone(), &agent)
+            .prepare(
+                store.context(&assignment.work_id).unwrap(),
+                assignment.clone(),
+                &agent,
+            )
             .unwrap();
+        assert!(prepared.package.text().contains("ChatGpt: ChatGPT"));
+        assert!(
+            prepared
+                .package
+                .text()
+                .contains("External review says preserve")
+        );
         let result = adapter.launch(prepared).unwrap();
         assert_eq!(result.exit_status, Some(0));
         assert!(result.stdout.contains("COMBE_HANDOFF_OK"));
@@ -387,6 +513,7 @@ mod tests {
             created_at: now,
             assignment_id: Some(assignment.id.clone()),
             execution_id: Some(result.execution_id),
+            origin: combe_state::TurnOrigin::Local,
         };
         store
             .finish_assignment(assignment.clone(), participant_result, turn, Vec::new())
@@ -395,10 +522,19 @@ mod tests {
         let reopened = FeltDbWorkStore::open(database_path).unwrap();
         let restored = reopened.context(&assignment.work_id).unwrap();
         assert!(
-            restored.recent_turns[0]
-                .content
-                .contains("COMBE_HANDOFF_OK")
+            restored
+                .recent_turns
+                .iter()
+                .any(|turn| turn.content.contains("COMBE_HANDOFF_OK"))
         );
         assert!(restored.active_assignments.is_empty());
+        assert_eq!(restored.conversations.len(), 1);
+        assert_eq!(restored.state.approved_proposals.len(), 1);
+        assert_eq!(restored.decisions[0].proposal_id, Some(proposal.id));
+        assert_eq!(assignment.proposal_id, restored.decisions[0].proposal_id);
+        assert!(restored.recent_turns.iter().any(|turn| matches!(
+            turn.origin,
+            combe_state::TurnOrigin::ExternalConversation(_)
+        )));
     }
 }

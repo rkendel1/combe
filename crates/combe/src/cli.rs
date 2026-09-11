@@ -11,9 +11,11 @@ use combe_catalog::{
     Catalog, State, add_repo, catalog, cleanup, load_state, remove_repo, save_state, state_path,
 };
 use combe_state::{
-    ArtifactId, ArtifactKind, AssignmentId, AssignmentStatus, FeltDbWorkStore,
-    FeltDbWorkspaceStore, Participant, ParticipantKind, ParticipantResult, TurnId, TurnKind, Work,
-    WorkArtifact, WorkAssignment, WorkDecision, WorkId, WorkStore, WorkTurn, WorkspaceStore,
+    ArtifactId, ArtifactKind, AssignmentId, AssignmentStatus, ConversationId, ConversationProvider,
+    ConversationRef, FeltDbWorkStore, FeltDbWorkspaceStore, Participant, ParticipantKind,
+    ParticipantResult, ProposalId, ProposalReview, ProposalStatus, ReviewId, ReviewOutcome, TurnId,
+    TurnKind, TurnOrigin, Work, WorkArtifact, WorkAssignment, WorkConversation, WorkDecision,
+    WorkId, WorkProposal, WorkStore, WorkTurn, WorkspaceStore,
 };
 
 const USAGE: &str = "\
@@ -29,11 +31,19 @@ Usage:
   combe work list [--workspace <id>]
   combe work create <title> [--workspace <id>] [--objective <text>]
   combe work show <id>
-  combe work context <id> [--json]
+  combe work context <id> [--format <text|json>]
   combe work decision <id> <statement> [--rationale <text>]
-  combe work assign <id> <participant> <instruction>
+  combe work proposal create <work-id> --participant <name-or-id> --title <title>
+  combe work proposal list <work-id>
+  combe work proposal show <proposal-id>
+  combe work proposal approve <proposal-id> --by <participant>
+  combe work proposal reject <proposal-id> --by <participant>
+  combe work proposal request-changes <proposal-id> --by <participant>
+  combe work assign <id> --to <participant> [--proposal <id>] --instruction <text>
   combe work handoff <id> --to <participant> --provider <codex|claude>
   combe work turn <id> --participant <name-or-id> [--kind <kind>]
+  combe work contribute <id> --participant <name-or-id> [--kind <kind>]
+  combe work import <id> --participant <name-or-id> --conversation <id> [--provider <provider>] [--title <title>] [--kind <kind>]
   combe work status <id> <active|paused|completed|archived>
   combe version             Show version information
   combe --fresh             Start without restoring previous session
@@ -89,9 +99,12 @@ fn work(args: &[String]) -> ExitCode {
         "show" => work_show(&store, &args[1..]),
         "context" => work_context(&store, &args[1..]),
         "decision" => work_decision(&store, &args[1..]),
+        "proposal" => work_proposal(&store, &args[1..]),
         "assign" => work_assign(&store, &args[1..]),
         "handoff" => work_handoff(&store, &args[1..]),
         "turn" => work_turn(&store, &args[1..]),
+        "contribute" => work_contribute(&store, &args[1..]),
+        "import" => work_import(&store, &args[1..]),
         "status" => work_status(&store, &args[1..]),
         other => {
             eprintln!("combe: unknown work command '{other}'");
@@ -170,6 +183,13 @@ fn work_show(store: &impl WorkStore, args: &[String]) -> ExitCode {
             println!("active assignments: {}", context.active_assignments.len());
             println!("decisions: {}", context.decisions.len());
             println!("artifacts: {}", context.artifacts.len());
+            println!("conversations: {}", context.conversations.len());
+            println!("active proposals: {}", context.state.active_proposals.len());
+            println!(
+                "approved proposals: {}",
+                context.state.approved_proposals.len()
+            );
+            println!("recent results: {}", context.state.recent_results.len());
             ExitCode::SUCCESS
         }
         Err(error) => work_error(error),
@@ -186,7 +206,10 @@ fn work_context(store: &impl WorkStore, args: &[String]) -> ExitCode {
         ContextPackage::from_context(context, assignment)
             .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))
     }) {
-        Ok(package) if args.iter().any(|arg| arg == "--json") => {
+        Ok(package)
+            if option(args, "--format").as_deref() == Some("json")
+                || args.iter().any(|arg| arg == "--json") =>
+        {
             match serde_json::to_string_pretty(&package) {
                 Ok(json) => {
                     println!("{json}");
@@ -195,9 +218,17 @@ fn work_context(store: &impl WorkStore, args: &[String]) -> ExitCode {
                 Err(error) => work_error(error),
             }
         }
-        Ok(package) => {
+        Ok(package)
+            if option(args, "--format")
+                .as_deref()
+                .is_none_or(|value| value == "text") =>
+        {
             print!("{}", package.text());
             ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            eprintln!("combe: context format must be text or json");
+            ExitCode::from(2)
         }
         Err(error) => work_error(error),
     }
@@ -224,6 +255,8 @@ fn work_decision(store: &impl WorkStore, args: &[String]) -> ExitCode {
             rationale: option(args, "--rationale"),
             decided_by: participant.id.clone(),
             created_at: Utc::now(),
+            proposal_id: None,
+            review_id: None,
         };
         let turn = WorkTurn {
             id: TurnId::new(),
@@ -234,6 +267,7 @@ fn work_decision(store: &impl WorkStore, args: &[String]) -> ExitCode {
             created_at: decision.created_at,
             assignment_id: None,
             execution_id: None,
+            origin: combe_state::TurnOrigin::Local,
         };
         store.record_decision(decision, Some(turn))
     })();
@@ -243,19 +277,194 @@ fn work_decision(store: &impl WorkStore, args: &[String]) -> ExitCode {
     }
 }
 
-fn work_assign(store: &impl WorkStore, args: &[String]) -> ExitCode {
-    if args.len() < 3 {
-        eprintln!("combe: work assign needs an id, participant, and instruction");
+fn work_proposal(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let Some(command) = args.first().map(String::as_str) else {
+        eprintln!("combe: work proposal needs a command");
         return ExitCode::from(2);
+    };
+    match command {
+        "create" => work_proposal_create(store, &args[1..]),
+        "list" => work_proposal_list(store, &args[1..]),
+        "show" => work_proposal_show(store, &args[1..]),
+        "approve" => work_proposal_review(store, &args[1..], ReviewOutcome::Approve),
+        "reject" => work_proposal_review(store, &args[1..], ReviewOutcome::Reject),
+        "request-changes" => work_proposal_review(store, &args[1..], ReviewOutcome::RequestChanges),
+        other => {
+            eprintln!("combe: unknown work proposal command '{other}'");
+            ExitCode::from(2)
+        }
     }
-    let id = WorkId(args[0].clone());
+}
+
+fn work_proposal_create(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let Some(work_id) = parse_work_id(args) else {
+        eprintln!("combe: work proposal create needs a work id");
+        return ExitCode::from(2);
+    };
+    let (Some(participant_value), Some(title)) =
+        (option(args, "--participant"), option(args, "--title"))
+    else {
+        eprintln!("combe: proposal create needs --participant and --title");
+        return ExitCode::from(2);
+    };
+    let statement = match stdin_content() {
+        Ok(statement) if !statement.trim().is_empty() => statement,
+        Ok(_) => {
+            eprintln!("combe: proposal create needs a statement on stdin");
+            return ExitCode::from(2);
+        }
+        Err(error) => return work_error(error),
+    };
+    let proposal_id = ProposalId::new();
+    let result = (|| {
+        let participant = participant(store, &work_id, &participant_value)?;
+        let origin = if let Some(conversation_id) = option(args, "--conversation") {
+            let link = store
+                .conversations(&work_id)?
+                .into_iter()
+                .find(|link| {
+                    link.participant_id == participant.id && link.conversation.id == conversation_id
+                })
+                .ok_or_else(|| {
+                    combe_state::StateError::InvalidEntity(format!(
+                        "conversation not linked to participant: {conversation_id}"
+                    ))
+                })?;
+            TurnOrigin::ExternalConversation(link.conversation)
+        } else {
+            TurnOrigin::Local
+        };
+        let now = Utc::now();
+        store.create_proposal(WorkProposal {
+            id: proposal_id.clone(),
+            work_id,
+            proposed_by: participant.id,
+            title,
+            statement,
+            rationale: option(args, "--rationale"),
+            status: if args.iter().any(|arg| arg == "--draft") {
+                ProposalStatus::Draft
+            } else {
+                ProposalStatus::Proposed
+            },
+            origin,
+            created_at: now,
+            updated_at: now,
+        })
+    })();
+    match result {
+        Ok(()) => {
+            let status = if args.iter().any(|arg| arg == "--draft") {
+                "draft"
+            } else {
+                "proposed"
+            };
+            println!("{proposal_id}\t{status}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => work_error(error),
+    }
+}
+
+fn work_proposal_list(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let Some(work_id) = parse_work_id(args) else {
+        eprintln!("combe: work proposal list needs a work id");
+        return ExitCode::from(2);
+    };
+    match store.proposals(&work_id) {
+        Ok(proposals) => {
+            for proposal in proposals {
+                println!("{}\t{:?}\t{}", proposal.id, proposal.status, proposal.title);
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => work_error(error),
+    }
+}
+
+fn work_proposal_show(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let Some(id) = args.first().map(|id| ProposalId(id.clone())) else {
+        eprintln!("combe: work proposal show needs a proposal id");
+        return ExitCode::from(2);
+    };
+    match store.load_proposal(&id) {
+        Ok(Some(proposal)) => {
+            println!("{} [{:?}]", proposal.title, proposal.status);
+            println!("id: {}", proposal.id);
+            println!("work: {}", proposal.work_id);
+            println!("proposed by: {}", proposal.proposed_by);
+            println!("\n{}", proposal.statement);
+            ExitCode::SUCCESS
+        }
+        Ok(None) => work_error(combe_state::StateError::NotFound {
+            entity_type: "proposal".into(),
+            id: id.0,
+        }),
+        Err(error) => work_error(error),
+    }
+}
+
+fn work_proposal_review(
+    store: &impl WorkStore,
+    args: &[String],
+    outcome: ReviewOutcome,
+) -> ExitCode {
+    let Some(proposal_id) = args.first().map(|id| ProposalId(id.clone())) else {
+        eprintln!("combe: proposal review needs a proposal id");
+        return ExitCode::from(2);
+    };
+    let Some(reviewer) = option(args, "--by") else {
+        eprintln!("combe: proposal review needs --by");
+        return ExitCode::from(2);
+    };
+    let result = (|| {
+        let proposal = store.load_proposal(&proposal_id)?.ok_or_else(|| {
+            combe_state::StateError::NotFound {
+                entity_type: "proposal".into(),
+                id: proposal_id.0.clone(),
+            }
+        })?;
+        let reviewer = participant(store, &proposal.work_id, &reviewer)?;
+        store.review_proposal(ProposalReview {
+            id: ReviewId::new(),
+            proposal_id,
+            reviewed_by: reviewer.id,
+            outcome,
+            comment: option(args, "--comment"),
+            origin: TurnOrigin::Local,
+            created_at: Utc::now(),
+        })
+    })();
+    match result {
+        Ok((proposal, _)) => {
+            println!("{}\t{:?}", proposal.id, proposal.status);
+            ExitCode::SUCCESS
+        }
+        Err(error) => work_error(error),
+    }
+}
+
+fn work_assign(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let Some(id_value) = args.first() else {
+        eprintln!("combe: work assign needs a work id");
+        return ExitCode::from(2);
+    };
+    let target =
+        option(args, "--to").or_else(|| args.get(1).filter(|v| !v.starts_with("--")).cloned());
+    let instruction = option(args, "--instruction")
+        .or_else(|| args.get(2).filter(|v| !v.starts_with("--")).cloned());
+    let (Some(target), Some(instruction)) = (target, instruction) else {
+        eprintln!("combe: work assign needs --to and --instruction");
+        return ExitCode::from(2);
+    };
+    let id = WorkId(id_value.clone());
     let result = (|| {
         let from = human(store, &id)?;
-        let to = match store.find_participant(&id, &args[1])? {
+        let to = match store.find_participant(&id, &target)? {
             Some(participant) => participant,
             None => {
                 let participant =
-                    Participant::new(id.clone(), ParticipantKind::Agent, args[1].clone());
+                    Participant::new(id.clone(), ParticipantKind::Agent, target.clone());
                 store.add_participant(participant.clone())?;
                 participant
             }
@@ -265,9 +474,10 @@ fn work_assign(store: &impl WorkStore, args: &[String]) -> ExitCode {
             work_id: id,
             from_participant_id: from.id,
             to_participant_id: to.id,
-            instruction: args[2].clone(),
+            instruction,
             status: AssignmentStatus::Pending,
             created_at: Utc::now(),
+            proposal_id: option(args, "--proposal").map(ProposalId),
         })
     })();
     match result {
@@ -284,42 +494,158 @@ fn participant(
     store
         .participants(id)?
         .into_iter()
-        .find(|participant| participant.id.0 == value || participant.name == value)
+        .find(|participant| {
+            participant.id.0 == value || participant.name.eq_ignore_ascii_case(value)
+        })
         .ok_or_else(|| {
             combe_state::StateError::InvalidEntity(format!("participant not found: {value}"))
         })
 }
 
 fn work_turn(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    work_contribute(store, args)
+}
+
+fn parse_turn_kind(args: &[String]) -> Result<TurnKind, String> {
+    match option(args, "--kind").as_deref().unwrap_or("message") {
+        "message" => Ok(TurnKind::Message),
+        "analysis" => Ok(TurnKind::Analysis),
+        "review" => Ok(TurnKind::Review),
+        "implementation" => Ok(TurnKind::Implementation),
+        "decision" => Ok(TurnKind::Decision),
+        other => Err(format!("invalid contribution kind '{other}'")),
+    }
+}
+
+fn stdin_content() -> Result<String, std::io::Error> {
+    let mut content = String::new();
+    std::io::stdin().read_to_string(&mut content)?;
+    Ok(content)
+}
+
+fn work_contribute(store: &impl WorkStore, args: &[String]) -> ExitCode {
     let Some(id) = parse_work_id(args) else {
-        eprintln!("combe: work turn needs an id");
+        eprintln!("combe: work contribute needs an id");
         return ExitCode::from(2);
     };
     let Some(participant_value) = option(args, "--participant") else {
-        eprintln!("combe: work turn needs --participant");
+        eprintln!("combe: work contribute needs --participant");
         return ExitCode::from(2);
     };
-    let kind = match option(args, "--kind").as_deref().unwrap_or("message") {
-        "message" => TurnKind::Message,
-        "analysis" => TurnKind::Analysis,
-        "review" => TurnKind::Review,
-        "implementation" => TurnKind::Implementation,
-        "decision" => TurnKind::Decision,
-        other => {
-            eprintln!("combe: invalid turn kind '{other}'");
+    let kind = match parse_turn_kind(args) {
+        Ok(kind) => kind,
+        Err(error) => {
+            eprintln!("combe: {error}");
             return ExitCode::from(2);
         }
     };
-    let mut content = String::new();
-    if let Err(error) = std::io::stdin().read_to_string(&mut content) {
-        return work_error(error);
-    }
+    let content = match stdin_content() {
+        Ok(content) => content,
+        Err(error) => return work_error(error),
+    };
     if content.trim().is_empty() {
-        eprintln!("combe: work turn needs content on stdin");
+        eprintln!("combe: work contribute needs content on stdin");
         return ExitCode::from(2);
     }
+    let turn_id = TurnId::new();
     let result = participant(store, &id, &participant_value).and_then(|participant| {
         store.add_turn(WorkTurn {
+            id: turn_id.clone(),
+            work_id: id,
+            participant_id: participant.id,
+            kind,
+            content,
+            created_at: Utc::now(),
+            assignment_id: None,
+            execution_id: None,
+            origin: TurnOrigin::Local,
+        })
+    });
+    match result {
+        Ok(()) => {
+            println!("{turn_id}");
+            ExitCode::SUCCESS
+        }
+        Err(error) => work_error(error),
+    }
+}
+
+fn conversation_provider(value: &str) -> ConversationProvider {
+    match value.to_ascii_lowercase().as_str() {
+        "chatgpt" | "chat-gpt" => ConversationProvider::ChatGpt,
+        "claude" | "claude-code" => ConversationProvider::Claude,
+        "codex" => ConversationProvider::Codex,
+        _ => ConversationProvider::Other(value.to_string()),
+    }
+}
+
+fn work_import(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let Some(id) = parse_work_id(args) else {
+        eprintln!("combe: work import needs an id");
+        return ExitCode::from(2);
+    };
+    let (Some(participant_value), Some(conversation_id)) = (
+        option(args, "--participant"),
+        option(args, "--conversation"),
+    ) else {
+        eprintln!("combe: work import needs --participant and --conversation");
+        return ExitCode::from(2);
+    };
+    let kind = match parse_turn_kind(args) {
+        Ok(kind) => kind,
+        Err(error) => {
+            eprintln!("combe: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let content = match stdin_content() {
+        Ok(content) => content,
+        Err(error) => return work_error(error),
+    };
+    let result = (|| {
+        let participant = match store.participants(&id)?.into_iter().find(|candidate| {
+            candidate.id.0 == participant_value
+                || candidate.name.eq_ignore_ascii_case(&participant_value)
+        }) {
+            Some(participant) => participant,
+            None => {
+                let participant = Participant::new(
+                    id.clone(),
+                    ParticipantKind::Agent,
+                    participant_value.clone(),
+                );
+                store.add_participant(participant.clone())?;
+                participant
+            }
+        };
+        let provider = conversation_provider(
+            option(args, "--provider")
+                .as_deref()
+                .unwrap_or(&participant_value),
+        );
+        let requested_reference = ConversationRef {
+            id: conversation_id,
+            provider,
+            title: option(args, "--title"),
+        };
+        let existing = store.conversations(&id)?.into_iter().find(|link| {
+            link.participant_id == participant.id
+                && link.conversation.id == requested_reference.id
+                && link.conversation.provider == requested_reference.provider
+        });
+        let reference = existing
+            .as_ref()
+            .map(|link| link.conversation.clone())
+            .unwrap_or_else(|| requested_reference.clone());
+        let conversation = existing.unwrap_or_else(|| WorkConversation {
+            id: ConversationId::new(),
+            work_id: id.clone(),
+            conversation: requested_reference,
+            participant_id: participant.id.clone(),
+            label: option(args, "--title"),
+            created_at: Utc::now(),
+        });
+        let turn = WorkTurn {
             id: TurnId::new(),
             work_id: id,
             participant_id: participant.id,
@@ -328,10 +654,17 @@ fn work_turn(store: &impl WorkStore, args: &[String]) -> ExitCode {
             created_at: Utc::now(),
             assignment_id: None,
             execution_id: None,
-        })
-    });
+            origin: TurnOrigin::ExternalConversation(reference),
+        };
+        let turn_id = turn.id.clone();
+        store.import_contribution(conversation, turn)?;
+        Ok::<TurnId, combe_state::StateError>(turn_id)
+    })();
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(turn_id) => {
+            println!("{turn_id}");
+            ExitCode::SUCCESS
+        }
         Err(error) => work_error(error),
     }
 }
@@ -402,6 +735,7 @@ fn work_handoff(store: &impl WorkStore, args: &[String]) -> ExitCode {
             created_at: now,
             assignment_id: Some(assignment.id.clone()),
             execution_id: Some(execution.execution_id),
+            origin: combe_state::TurnOrigin::Local,
         };
         let artifacts = git_artifacts(&context_worktree(store, &id)?, &id, &participant.id, now);
         store.finish_assignment(assignment, result, turn, artifacts)?;

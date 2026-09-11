@@ -1,12 +1,17 @@
 use crate::{
-    ArtifactId, AssignmentId, Participant, ParticipantId, ParticipantResult, Result, TurnId, Work,
-    WorkArtifact, WorkAssignment, WorkContext, WorkDecision, WorkId, WorkStatus, WorkTurn,
+    ArtifactId, AssignmentId, ConversationId, Participant, ParticipantId, ParticipantResult,
+    ProposalId, ProposalReview, ProposalStatus, Result, ReviewId, TurnId, Work, WorkArtifact,
+    WorkAssignment, WorkContext, WorkConversation, WorkDecision, WorkId, WorkProposal, WorkStatus,
+    WorkTurn,
 };
 
 pub const CONTEXT_TURN_LIMIT: usize = 50;
 pub const CONTEXT_DECISION_LIMIT: usize = 100;
 pub const CONTEXT_ARTIFACT_LIMIT: usize = 100;
 pub const CONTEXT_TEXT_LIMIT: usize = 16 * 1024;
+pub const CONTEXT_CONVERSATION_LIMIT: usize = 100;
+pub const CONTEXT_PROPOSAL_LIMIT: usize = 100;
+pub const CONTEXT_REVIEW_LIMIT: usize = 100;
 
 pub trait WorkStore: Send + Sync {
     fn create_work(&self, work: Work, participants: Vec<Participant>) -> Result<()>;
@@ -60,4 +65,19 @@ pub trait WorkStore: Send + Sync {
     fn load_result(&self, _id: &str) -> Result<Option<ParticipantResult>> {
         Ok(None)
     }
+    fn conversations(&self, work_id: &WorkId) -> Result<Vec<WorkConversation>>;
+    fn import_contribution(&self, conversation: WorkConversation, turn: WorkTurn) -> Result<()>;
+    fn load_conversation(&self, _id: &ConversationId) -> Result<Option<WorkConversation>> {
+        Ok(None)
+    }
+    fn create_proposal(&self, proposal: WorkProposal) -> Result<()>;
+    fn proposals(&self, work_id: &WorkId) -> Result<Vec<WorkProposal>>;
+    fn load_proposal(&self, id: &ProposalId) -> Result<Option<WorkProposal>>;
+    fn set_proposal_status(&self, id: &ProposalId, status: ProposalStatus) -> Result<WorkProposal>;
+    fn review_proposal(
+        &self,
+        review: ProposalReview,
+    ) -> Result<(WorkProposal, Option<WorkDecision>)>;
+    fn reviews(&self, proposal_id: &ProposalId) -> Result<Vec<ProposalReview>>;
+    fn load_review(&self, id: &ReviewId) -> Result<Option<ProposalReview>>;
 }

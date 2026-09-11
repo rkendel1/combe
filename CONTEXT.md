@@ -32,5 +32,11 @@ Use these words in code, commits, and docs. If a new domain word sticks, add it 
 | Handoff | A human-authorized transfer of an Assignment and bounded Work context to a Participant. |
 | Participant adapter | The ephemeral boundary that prepares a provider-neutral Handoff for an installed external execution system. |
 | FeltDB owner | The one live process owning a local database path. Clones and repeated opens share state inside it; another process is rejected. |
+| Conversation reference | Provider-neutral identity for an external conversation. The provider retains the conversation and its history. |
+| Work conversation | Durable relationship between a Work, Participant, and external Conversation reference. It is not a conversation mirror. |
+| Contribution | A bounded Turn supplied locally or imported from an external conversation with explicit provenance. |
+| Proposal | A provider-neutral statement being considered by a Work, with explicit author, provenance, and lifecycle. |
+| Proposal review | A durable participant evaluation that approves, rejects, or requests changes to a Proposal. It is not itself authorization. |
+| Coordination state | The deterministic current-state projection of proposals, reviews, decisions, assignments, and recent results. |
 
 Out of vocabulary: agent session, workbench, desk, execution host, orcad, theme, setting, preference pane.
