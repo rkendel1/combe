@@ -29,5 +29,7 @@ Use these words in code, commits, and docs. If a new domain word sticks, add it 
 | Assignment | A durable handoff from one Work participant to another. It records intent and state but does not dispatch execution. |
 | Decision | An independently queryable statement and optional rationale recorded for a Work. |
 | Artifact | A durable reference from a Work to a repository-owned file, patch, commit, report, review, or note. |
+| Handoff | A human-authorized transfer of an Assignment and bounded Work context to a Participant. |
+| Participant adapter | The ephemeral boundary that prepares a provider-neutral Handoff for an installed external execution system. |
 
 Out of vocabulary: agent session, workbench, desk, execution host, orcad, theme, setting, preference pane.

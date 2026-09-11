@@ -1,11 +1,12 @@
 use crate::{
-    ArtifactId, AssignmentId, Participant, ParticipantId, Result, TurnId, Work, WorkArtifact,
-    WorkAssignment, WorkContext, WorkDecision, WorkId, WorkStatus, WorkTurn,
+    ArtifactId, AssignmentId, Participant, ParticipantId, ParticipantResult, Result, TurnId, Work,
+    WorkArtifact, WorkAssignment, WorkContext, WorkDecision, WorkId, WorkStatus, WorkTurn,
 };
 
 pub const CONTEXT_TURN_LIMIT: usize = 50;
 pub const CONTEXT_DECISION_LIMIT: usize = 100;
 pub const CONTEXT_ARTIFACT_LIMIT: usize = 100;
+pub const CONTEXT_TEXT_LIMIT: usize = 16 * 1024;
 
 pub trait WorkStore: Send + Sync {
     fn create_work(&self, work: Work, participants: Vec<Participant>) -> Result<()>;
@@ -33,6 +34,13 @@ pub trait WorkStore: Send + Sync {
         turn: WorkTurn,
         artifacts: Vec<WorkArtifact>,
     ) -> Result<()>;
+    fn finish_assignment(
+        &self,
+        assignment: WorkAssignment,
+        result: ParticipantResult,
+        turn: WorkTurn,
+        artifacts: Vec<WorkArtifact>,
+    ) -> Result<()>;
     fn context(&self, work_id: &WorkId) -> Result<WorkContext>;
     fn find_participant(&self, work_id: &WorkId, name: &str) -> Result<Option<Participant>> {
         Ok(self
@@ -47,6 +55,9 @@ pub trait WorkStore: Send + Sync {
         Ok(None)
     }
     fn load_artifact(&self, _id: &ArtifactId) -> Result<Option<WorkArtifact>> {
+        Ok(None)
+    }
+    fn load_result(&self, _id: &str) -> Result<Option<ParticipantResult>> {
         Ok(None)
     }
 }

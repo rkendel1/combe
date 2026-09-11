@@ -1,12 +1,19 @@
+use crate::chrome_view::ClickView;
 use combe_state::{ParticipantKind, WorkContext};
 use objc2::MainThreadOnly;
 use objc2::rc::Retained;
 use objc2_app_kit::{
-    NSAutoresizingMaskOptions, NSColor, NSFont, NSLineBreakMode, NSScrollView, NSTextField, NSView,
+    NSAccessibility, NSAutoresizingMaskOptions, NSColor, NSFont, NSLineBreakMode, NSScrollView,
+    NSTextField, NSView,
 };
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
-pub fn new(mtm: MainThreadMarker, frame: NSRect, context: &WorkContext) -> Retained<NSScrollView> {
+pub fn new(
+    mtm: MainThreadMarker,
+    frame: NSRect,
+    context: &WorkContext,
+    handoff: Option<Box<dyn Fn()>>,
+) -> Retained<NSScrollView> {
     let width = frame.size.width.min(380.0).max(280.0);
     let panel_frame = NSRect::new(
         NSPoint::new(frame.size.width - width, 0.0),
@@ -39,6 +46,21 @@ pub fn new(mtm: MainThreadMarker, frame: NSRect, context: &WorkContext) -> Retai
         ),
     );
     document.addSubview(&field);
+    if let Some(handoff) = handoff {
+        let button = ClickView::new(
+            mtm,
+            NSRect::new(
+                NSPoint::new(20.0, frame.size.height.max(640.0) - 48.0),
+                NSSize::new(100.0, 32.0),
+            ),
+            "Handoff…",
+            12.0,
+            12.0,
+            handoff,
+        );
+        button.setAccessibilityLabel(Some(&NSString::from_str("Handoff Work")));
+        document.addSubview(&button);
+    }
     panel.setDocumentView(Some(&document));
     panel
 }

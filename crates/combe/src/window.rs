@@ -35,7 +35,7 @@ use crate::split;
 use crate::surface::SurfaceView;
 use crate::tabs::Tabs;
 use crate::work_overview;
-use combe_state::{FeltDbWorkStore, WorkId, WorkStore};
+use combe_state::{FeltDbWorkStore, ParticipantKind, WorkContext, WorkId, WorkStore};
 
 const ROW_HEIGHT: f64 = 36.0;
 const HEADER_HEIGHT: f64 = 30.0;
@@ -992,11 +992,92 @@ fn open_work_overview(id: &WorkId) {
     STATE.with(|state| {
         let mut state = state.borrow_mut();
         let Some(state) = state.as_mut() else { return };
-        let view = work_overview::new(mtm, state.content.bounds(), &context);
+        let handoff_id = id.clone();
+        let handoff = (!handoff_options(&context).is_empty())
+            .then(|| Box::new(move || choose_handoff(&handoff_id)) as Box<dyn Fn()>);
+        let view = work_overview::new(mtm, state.content.bounds(), &context, handoff);
         state.content.addSubview(&view);
         state.work_overview = Some(view);
         layout_work_overview(state);
     });
+}
+
+fn handoff_options(context: &WorkContext) -> Vec<(String, String, &'static str)> {
+    let providers = [("Codex", "codex"), ("Claude Code", "claude")]
+        .into_iter()
+        .filter(|(_, executable)| which::which(executable).is_ok());
+    context
+        .participants
+        .iter()
+        .filter(|participant| participant.kind == ParticipantKind::Agent)
+        .flat_map(|participant| {
+            providers.clone().map(|(label, provider)| {
+                (
+                    format!("{} — {label}", participant.name),
+                    participant.name.clone(),
+                    provider,
+                )
+            })
+        })
+        .collect()
+}
+
+fn choose_handoff(id: &WorkId) {
+    let Ok(store) = FeltDbWorkStore::for_combe() else {
+        return;
+    };
+    let Ok(context) = store.context(id) else {
+        return;
+    };
+    let options = handoff_options(&context);
+    if options.is_empty() {
+        return;
+    }
+    let mtm = MainThreadMarker::new().expect("main thread");
+    let alert = NSAlert::new(mtm);
+    alert.setMessageText(&NSString::from_str("Handoff Work"));
+    alert.setInformativeText(&NSString::from_str(
+        "Choose an available participant. The handoff runs in the focused terminal.",
+    ));
+    for (label, _, _) in &options {
+        alert.addButtonWithTitle(&NSString::from_str(label));
+    }
+    alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+    let index = alert.runModal() - NSAlertFirstButtonReturn;
+    let Ok(index) = usize::try_from(index) else {
+        return;
+    };
+    let Some((_, participant, provider)) = options.get(index) else {
+        return;
+    };
+    let Ok(executable) = std::env::current_exe() else {
+        return;
+    };
+    let command = format!(
+        "{} work handoff {} --to {} --provider {}\r",
+        shell_word(&executable.to_string_lossy()),
+        shell_word(&id.0),
+        shell_word(participant),
+        shell_word(provider),
+    );
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(surface) = state
+            .as_ref()
+            .and_then(|state| state.tabs.active()?.focused_surface())
+        {
+            surface.binding_action(&format!("text:{command}"));
+            state
+                .as_ref()
+                .unwrap()
+                .window
+                .makeFirstResponder(Some(&surface));
+        }
+    });
+}
+
+fn shell_word(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn layout_work_overview(state: &State) {

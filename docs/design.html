@@ -236,6 +236,7 @@
     .work-objective { margin: 18px 0 24px; color: var(--text-soft); line-height: 1.55; }
     .work-overview h2 { margin: 20px 0 8px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
     .work-overview ul { margin: 0; padding-left: 18px; color: var(--text-soft); line-height: 1.55; }
+    .work-handoff { margin-top: 20px; border: 0; border-radius: 8px; padding: 7px 14px; background: var(--selection); color: var(--text-strong); }
     .work-group { margin-top: 16px; padding-top: 8px; border-top: .5px solid var(--line); }
     .work-row { padding-left: 32px; }
     .work-row .work-state { margin-left: auto; color: var(--green); font-size: 11px; }
@@ -318,7 +319,7 @@
         </aside>
         <section class="right" aria-label="Terminal preview">
           <div class="tabs" id="tabs"></div>
-          <div class="term"><div class="pane" id="left"></div><div class="pane" id="right"></div><article class="work-overview" id="work-overview" aria-label="Work overview" hidden><h1>FeltDB integration</h1><span class="work-status">Active</span><p class="work-objective">Establish durable, provider-neutral context that humans and external agents can continue.</p><h2>Participants</h2><ul><li>Randy · Human</li><li>Implementation agent · Agent</li><li>Security reviewer · Agent</li></ul><h2>Active assignments</h2><ul><li>Implement the WorkStore adapter</li></ul><h2>Decisions</h2><ul><li>Use FeltDB directly from Combe</li></ul><h2>Recent turns</h2><ul><li>Architecture accepted</li><li>Implementation in progress</li></ul></article></div>
+          <div class="term"><div class="pane" id="left"></div><div class="pane" id="right"></div><article class="work-overview" id="work-overview" aria-label="Work overview" hidden><h1>FeltDB integration</h1><span class="work-status">Active</span><p class="work-objective">Establish durable, provider-neutral context that humans and external agents can continue.</p><button class="work-handoff" id="work-handoff" type="button">Handoff…</button><h2>Participants</h2><ul><li>Randy · Human</li><li>Codex · Agent</li><li>Security reviewer · Agent</li></ul><h2>Active assignments</h2><ul><li>Implement the WorkStore adapter</li></ul><h2>Decisions</h2><ul><li>Use FeltDB directly from Combe</li></ul><h2>Recent turns</h2><ul><li>Architecture accepted</li><li>Implementation in progress</li></ul></article></div>
           <footer class="status-line" aria-label="Usage status">
             <div class="quota" id="quota">
               <div class="quota-details" id="quota-details" role="region" aria-label="Quota details" tabindex="-1" inert>
@@ -566,6 +567,7 @@
       if (value === "confirm" && !dialog.open) dialog.showModal();
     }
     document.getElementById("component").addEventListener("change", renderTabs);
+    document.getElementById("work-handoff").addEventListener("click", () => showToast("Handoff to Codex in this workspace terminal"));
 
     function setMode(next) {
       clearTimeout(menuTimer);

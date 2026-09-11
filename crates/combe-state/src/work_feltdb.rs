@@ -7,11 +7,13 @@ use serde::de::DeserializeOwned;
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::work_store::{CONTEXT_ARTIFACT_LIMIT, CONTEXT_DECISION_LIMIT, CONTEXT_TURN_LIMIT};
+use crate::work_store::{
+    CONTEXT_ARTIFACT_LIMIT, CONTEXT_DECISION_LIMIT, CONTEXT_TEXT_LIMIT, CONTEXT_TURN_LIMIT,
+};
 use crate::{
-    ArtifactId, AssignmentId, AssignmentStatus, Participant, ParticipantId, Result, StateError,
-    TurnId, Work, WorkArtifact, WorkAssignment, WorkContext, WorkDecision, WorkId, WorkStatus,
-    WorkStore, WorkTurn,
+    ArtifactId, AssignmentId, AssignmentStatus, Participant, ParticipantId, ParticipantResult,
+    Result, StateError, TurnId, Work, WorkArtifact, WorkAssignment, WorkContext, WorkDecision,
+    WorkId, WorkStatus, WorkStore, WorkTurn,
 };
 
 pub struct FeltDbWorkStore {
@@ -326,6 +328,53 @@ impl WorkStore for FeltDbWorkStore {
         self.atomic(mutations, preconditions)
     }
 
+    fn finish_assignment(
+        &self,
+        assignment: WorkAssignment,
+        result: ParticipantResult,
+        turn: WorkTurn,
+        artifacts: Vec<WorkArtifact>,
+    ) -> Result<()> {
+        if !matches!(
+            assignment.status,
+            AssignmentStatus::Completed | AssignmentStatus::Failed
+        ) || result.work_id != assignment.work_id
+            || result.assignment_id != assignment.id
+            || result.participant_id != assignment.to_participant_id
+            || turn.work_id != assignment.work_id
+            || turn.participant_id != assignment.to_participant_id
+            || turn.assignment_id.as_ref() != Some(&assignment.id)
+            || turn.execution_id.as_deref() != Some(result.execution_id.as_str())
+        {
+            return Err(StateError::InvalidEntity(
+                "participant result provenance does not match assignment".into(),
+            ));
+        }
+        self.validate_participant(&assignment.work_id, &assignment.to_participant_id)?;
+        if artifacts.iter().any(|artifact| {
+            artifact.work_id != assignment.work_id
+                || artifact.created_by != assignment.to_participant_id
+        }) {
+            return Err(StateError::InvalidEntity(
+                "result artifact provenance does not match".into(),
+            ));
+        }
+        let mut mutations = vec![
+            Self::mutation("assignment", &assignment.id.0, &assignment)?,
+            Self::mutation("result", &result.id, &result)?,
+            Self::mutation("turn", &turn.id.0, &turn)?,
+        ];
+        let mut preconditions = vec![
+            Self::absent("result", &result.id),
+            Self::absent("turn", &turn.id.0),
+        ];
+        for artifact in artifacts {
+            mutations.push(Self::mutation("artifact", &artifact.id.0, &artifact)?);
+            preconditions.push(Self::absent("artifact", &artifact.id.0));
+        }
+        self.atomic(mutations, preconditions)
+    }
+
     fn context(&self, work_id: &WorkId) -> Result<WorkContext> {
         let work = self.require_work(work_id)?;
         let participants = self.participants(work_id)?;
@@ -337,6 +386,10 @@ impl WorkStore for FeltDbWorkStore {
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
+            .map(|mut turn| {
+                turn.content = bounded(&turn.content);
+                turn
+            })
             .collect();
         let active_assignments = self
             .assignments(work_id)?
@@ -385,6 +438,20 @@ impl WorkStore for FeltDbWorkStore {
     fn load_artifact(&self, id: &ArtifactId) -> Result<Option<WorkArtifact>> {
         self.get("artifact", &id.0)
     }
+    fn load_result(&self, id: &str) -> Result<Option<ParticipantResult>> {
+        self.get("result", id)
+    }
+}
+
+fn bounded(value: &str) -> String {
+    if value.len() <= CONTEXT_TEXT_LIMIT {
+        return value.to_string();
+    }
+    let mut end = CONTEXT_TEXT_LIMIT;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated]", &value[..end])
 }
 
 #[cfg(test)]
@@ -460,6 +527,8 @@ mod tests {
                     kind: TurnKind::Review,
                     content: content.into(),
                     created_at: Utc::now(),
+                    assignment_id: None,
+                    execution_id: None,
                 })
                 .unwrap();
         }
@@ -539,6 +608,8 @@ mod tests {
             kind: TurnKind::Implementation,
             content: "Done".into(),
             created_at: Utc::now(),
+            assignment_id: None,
+            execution_id: None,
         };
         let artifact = WorkArtifact {
             id: ArtifactId::new(),
@@ -563,5 +634,62 @@ mod tests {
             .unwrap();
         assert!(store.load_turn(&turn.id).unwrap().is_some());
         assert!(store.load_artifact(&artifact.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn participant_result_and_provenance_turn_persist_after_reopen() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("work.db");
+        let (work_id, turn_id) = {
+            let store = FeltDbWorkStore::open(&path).unwrap();
+            let (work, human, agent) = work_with_participants(&store);
+            let assignment = WorkAssignment {
+                id: AssignmentId::new(),
+                work_id: work.id.clone(),
+                from_participant_id: human.id,
+                to_participant_id: agent.id.clone(),
+                instruction: "Review".into(),
+                status: AssignmentStatus::Failed,
+                created_at: Utc::now(),
+            };
+            store.add_assignment(assignment.clone()).unwrap();
+            let execution_id = "execution-1".to_string();
+            let result = ParticipantResult {
+                id: "result-1".into(),
+                work_id: work.id.clone(),
+                participant_id: agent.id.clone(),
+                assignment_id: assignment.id.clone(),
+                execution_id: execution_id.clone(),
+                exit_status: Some(7),
+                summary: Some("review failed".into()),
+                output: Some("details".into()),
+                created_at: Utc::now(),
+            };
+            let turn = WorkTurn {
+                id: TurnId::new(),
+                work_id: work.id.clone(),
+                participant_id: agent.id,
+                kind: TurnKind::Review,
+                content: "details".into(),
+                created_at: Utc::now(),
+                assignment_id: Some(assignment.id.clone()),
+                execution_id: Some(execution_id),
+            };
+            store
+                .finish_assignment(assignment, result, turn.clone(), Vec::new())
+                .unwrap();
+            (work.id, turn.id)
+        };
+        let store = FeltDbWorkStore::open(&path).unwrap();
+        let turn = store.load_turn(&turn_id).unwrap().unwrap();
+        assert_eq!(turn.execution_id.as_deref(), Some("execution-1"));
+        assert_eq!(
+            store.load_result("result-1").unwrap().unwrap().exit_status,
+            Some(7)
+        );
+        assert_eq!(
+            store.assignments(&work_id).unwrap()[0].status,
+            AssignmentStatus::Failed
+        );
     }
 }

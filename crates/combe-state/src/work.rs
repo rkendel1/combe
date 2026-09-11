@@ -120,6 +120,23 @@ pub struct WorkTurn {
     pub kind: TurnKind,
     pub content: String,
     pub created_at: Timestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_id: Option<AssignmentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ParticipantResult {
+    pub id: String,
+    pub work_id: WorkId,
+    pub participant_id: ParticipantId,
+    pub assignment_id: AssignmentId,
+    pub execution_id: String,
+    pub exit_status: Option<i32>,
+    pub summary: Option<String>,
+    pub output: Option<String>,
+    pub created_at: Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -130,6 +147,7 @@ pub enum AssignmentStatus {
     Completed,
     Rejected,
     Cancelled,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -1,15 +1,19 @@
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
+use crate::participant_adapter::{
+    ContextPackage, LocalCliAdapter, LocalProvider, ParticipantAdapter,
+};
 use chrono::Utc;
 use combe_catalog::{
     Catalog, State, add_repo, catalog, cleanup, load_state, remove_repo, save_state, state_path,
 };
 use combe_state::{
-    AssignmentId, AssignmentStatus, FeltDbWorkStore, FeltDbWorkspaceStore, Participant,
-    ParticipantKind, TurnId, TurnKind, Work, WorkAssignment, WorkDecision, WorkId, WorkStore,
-    WorkTurn, WorkspaceStore,
+    ArtifactId, ArtifactKind, AssignmentId, AssignmentStatus, FeltDbWorkStore,
+    FeltDbWorkspaceStore, Participant, ParticipantKind, ParticipantResult, TurnId, TurnKind, Work,
+    WorkArtifact, WorkAssignment, WorkDecision, WorkId, WorkStore, WorkTurn, WorkspaceStore,
 };
 
 const USAGE: &str = "\
@@ -28,6 +32,8 @@ Usage:
   combe work context <id> [--json]
   combe work decision <id> <statement> [--rationale <text>]
   combe work assign <id> <participant> <instruction>
+  combe work handoff <id> --to <participant> --provider <codex|claude>
+  combe work turn <id> --participant <name-or-id> [--kind <kind>]
   combe work status <id> <active|paused|completed|archived>
   combe version             Show version information
   combe --fresh             Start without restoring previous session
@@ -84,6 +90,8 @@ fn work(args: &[String]) -> ExitCode {
         "context" => work_context(&store, &args[1..]),
         "decision" => work_decision(&store, &args[1..]),
         "assign" => work_assign(&store, &args[1..]),
+        "handoff" => work_handoff(&store, &args[1..]),
+        "turn" => work_turn(&store, &args[1..]),
         "status" => work_status(&store, &args[1..]),
         other => {
             eprintln!("combe: unknown work command '{other}'");
@@ -173,9 +181,13 @@ fn work_context(store: &impl WorkStore, args: &[String]) -> ExitCode {
         eprintln!("combe: work context needs an id");
         return ExitCode::from(2);
     };
-    match store.context(&id) {
-        Ok(context) if args.iter().any(|arg| arg == "--json") => {
-            match serde_json::to_string_pretty(&context) {
+    match store.context(&id).and_then(|context| {
+        let assignment = context.active_assignments.first().cloned();
+        ContextPackage::from_context(context, assignment)
+            .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))
+    }) {
+        Ok(package) if args.iter().any(|arg| arg == "--json") => {
+            match serde_json::to_string_pretty(&package) {
                 Ok(json) => {
                     println!("{json}");
                     ExitCode::SUCCESS
@@ -183,49 +195,8 @@ fn work_context(store: &impl WorkStore, args: &[String]) -> ExitCode {
                 Err(error) => work_error(error),
             }
         }
-        Ok(context) => {
-            println!("# {}\n", context.work.title);
-            if let Some(objective) = context.work.objective {
-                println!("Objective: {objective}\n");
-            }
-            println!(
-                "Status: {:?}\nWorkspace: {}",
-                context.work.status, context.work.workspace_id
-            );
-            if !context.participants.is_empty() {
-                println!("\nParticipants");
-                for participant in context.participants {
-                    println!("- {} ({:?})", participant.name, participant.kind);
-                }
-            }
-            if !context.active_assignments.is_empty() {
-                println!("\nActive assignments");
-                for assignment in context.active_assignments {
-                    println!("- {:?}: {}", assignment.status, assignment.instruction);
-                }
-            }
-            if !context.decisions.is_empty() {
-                println!("\nDecisions");
-                for decision in context.decisions {
-                    println!("- {}", decision.statement);
-                }
-            }
-            if !context.artifacts.is_empty() {
-                println!("\nArtifacts");
-                for artifact in context.artifacts {
-                    println!(
-                        "- {:?}: {}",
-                        artifact.kind,
-                        artifact.path.or(artifact.description).unwrap_or_default()
-                    );
-                }
-            }
-            if !context.recent_turns.is_empty() {
-                println!("\nRecent turns");
-                for turn in context.recent_turns {
-                    println!("- {:?}: {}", turn.kind, turn.content);
-                }
-            }
+        Ok(package) => {
+            print!("{}", package.text());
             ExitCode::SUCCESS
         }
         Err(error) => work_error(error),
@@ -261,6 +232,8 @@ fn work_decision(store: &impl WorkStore, args: &[String]) -> ExitCode {
             kind: TurnKind::Decision,
             content: decision.statement.clone(),
             created_at: decision.created_at,
+            assignment_id: None,
+            execution_id: None,
         };
         store.record_decision(decision, Some(turn))
     })();
@@ -301,6 +274,210 @@ fn work_assign(store: &impl WorkStore, args: &[String]) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => work_error(error),
     }
+}
+
+fn participant(
+    store: &impl WorkStore,
+    id: &WorkId,
+    value: &str,
+) -> combe_state::Result<Participant> {
+    store
+        .participants(id)?
+        .into_iter()
+        .find(|participant| participant.id.0 == value || participant.name == value)
+        .ok_or_else(|| {
+            combe_state::StateError::InvalidEntity(format!("participant not found: {value}"))
+        })
+}
+
+fn work_turn(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let Some(id) = parse_work_id(args) else {
+        eprintln!("combe: work turn needs an id");
+        return ExitCode::from(2);
+    };
+    let Some(participant_value) = option(args, "--participant") else {
+        eprintln!("combe: work turn needs --participant");
+        return ExitCode::from(2);
+    };
+    let kind = match option(args, "--kind").as_deref().unwrap_or("message") {
+        "message" => TurnKind::Message,
+        "analysis" => TurnKind::Analysis,
+        "review" => TurnKind::Review,
+        "implementation" => TurnKind::Implementation,
+        "decision" => TurnKind::Decision,
+        other => {
+            eprintln!("combe: invalid turn kind '{other}'");
+            return ExitCode::from(2);
+        }
+    };
+    let mut content = String::new();
+    if let Err(error) = std::io::stdin().read_to_string(&mut content) {
+        return work_error(error);
+    }
+    if content.trim().is_empty() {
+        eprintln!("combe: work turn needs content on stdin");
+        return ExitCode::from(2);
+    }
+    let result = participant(store, &id, &participant_value).and_then(|participant| {
+        store.add_turn(WorkTurn {
+            id: TurnId::new(),
+            work_id: id,
+            participant_id: participant.id,
+            kind,
+            content,
+            created_at: Utc::now(),
+            assignment_id: None,
+            execution_id: None,
+        })
+    });
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => work_error(error),
+    }
+}
+
+fn work_handoff(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let Some(id) = parse_work_id(args) else {
+        eprintln!("combe: work handoff needs an id");
+        return ExitCode::from(2);
+    };
+    let (Some(target), Some(provider_name)) = (option(args, "--to"), option(args, "--provider"))
+    else {
+        eprintln!("combe: work handoff needs --to and --provider");
+        return ExitCode::from(2);
+    };
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let participant = participant(store, &id, &target)?;
+        let provider = LocalProvider::parse(&provider_name)?;
+        let adapter = LocalCliAdapter::discover(provider)?;
+        let context = store.context(&id)?;
+        let mut assignment = context
+            .active_assignments
+            .iter()
+            .find(|assignment| {
+                assignment.to_participant_id == participant.id
+                    && assignment.status == AssignmentStatus::Pending
+            })
+            .cloned()
+            .ok_or_else(|| format!("no pending assignment for participant {target}"))?;
+        let prepared = adapter.prepare(context, assignment.clone(), &participant)?;
+        assignment = store.set_assignment_status(&assignment.id, AssignmentStatus::Active)?;
+        let execution = match adapter.launch(prepared) {
+            Ok(execution) => execution,
+            Err(error) => {
+                store.set_assignment_status(&assignment.id, AssignmentStatus::Failed)?;
+                return Err(Box::new(error));
+            }
+        };
+        assignment.status = if execution.exit_status == Some(0) {
+            AssignmentStatus::Completed
+        } else {
+            AssignmentStatus::Failed
+        };
+        let mut output = execution.stdout.trim().to_string();
+        if !execution.stderr.trim().is_empty() {
+            if !output.is_empty() {
+                output.push_str("\n\nSTDERR\n");
+            }
+            output.push_str(execution.stderr.trim());
+        }
+        let now = Utc::now();
+        let result = ParticipantResult {
+            id: uuid::Uuid::new_v4().to_string(),
+            work_id: id.clone(),
+            participant_id: participant.id.clone(),
+            assignment_id: assignment.id.clone(),
+            execution_id: execution.execution_id.clone(),
+            exit_status: execution.exit_status,
+            summary: output.lines().next().map(str::to_owned),
+            output: (!output.is_empty()).then(|| output.clone()),
+            created_at: now,
+        };
+        let turn = WorkTurn {
+            id: TurnId::new(),
+            work_id: id.clone(),
+            participant_id: participant.id.clone(),
+            kind: TurnKind::Implementation,
+            content: output,
+            created_at: now,
+            assignment_id: Some(assignment.id.clone()),
+            execution_id: Some(execution.execution_id),
+        };
+        let artifacts = git_artifacts(&context_worktree(store, &id)?, &id, &participant.id, now);
+        store.finish_assignment(assignment, result, turn, artifacts)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => work_error(error),
+    }
+}
+
+fn context_worktree(store: &impl WorkStore, id: &WorkId) -> combe_state::Result<String> {
+    let workspace_id = store
+        .load_work(id)?
+        .map(|work| work.workspace_id)
+        .ok_or_else(|| combe_state::StateError::NotFound {
+            entity_type: "work".into(),
+            id: id.0.clone(),
+        })?;
+    Ok(FeltDbWorkspaceStore::for_combe()
+        .ok()
+        .and_then(|store| store.load_workspace(&workspace_id).ok().flatten())
+        .map(|workspace| workspace.path)
+        .unwrap_or(workspace_id))
+}
+
+fn git_artifacts(
+    worktree: &str,
+    work_id: &WorkId,
+    participant_id: &combe_state::ParticipantId,
+    created_at: chrono::DateTime<Utc>,
+) -> Vec<WorkArtifact> {
+    let mut artifacts = Vec::new();
+    if let Ok(output) = Command::new("git")
+        .args(["-C", worktree, "status", "--porcelain=v1"])
+        .output()
+        && output.status.success()
+    {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let path = line
+                .get(3..)
+                .unwrap_or("")
+                .split(" -> ")
+                .last()
+                .unwrap_or("")
+                .trim();
+            if !path.is_empty() {
+                artifacts.push(WorkArtifact {
+                    id: ArtifactId::new(),
+                    work_id: work_id.clone(),
+                    kind: ArtifactKind::File,
+                    path: Some(path.into()),
+                    description: Some("Changed during participant execution".into()),
+                    created_by: participant_id.clone(),
+                    created_at,
+                });
+            }
+        }
+    }
+    if let Ok(output) = Command::new("git")
+        .args(["-C", worktree, "rev-parse", "HEAD"])
+        .output()
+        && output.status.success()
+    {
+        let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        artifacts.push(WorkArtifact {
+            id: ArtifactId::new(),
+            work_id: work_id.clone(),
+            kind: ArtifactKind::Commit,
+            path: None,
+            description: Some(commit),
+            created_by: participant_id.clone(),
+            created_at,
+        });
+    }
+    artifacts
 }
 
 fn work_status(store: &impl WorkStore, args: &[String]) -> ExitCode {

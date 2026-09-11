@@ -4,6 +4,7 @@ mod find_bar;
 mod ghostty;
 mod habits;
 mod overview;
+mod participant_adapter;
 mod quota;
 mod quota_panel;
 mod recovery;
