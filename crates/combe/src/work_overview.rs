@@ -39,10 +39,13 @@ pub fn new(
     panel.setHasVerticalScroller(true);
 
     let text = content(context);
+    let document_height = ((text.lines().count() as f64 * 18.0) + 160.0)
+        .max(frame.size.height)
+        .max(640.0);
     let field = NSTextField::wrappingLabelWithString(&NSString::from_str(&text), mtm);
     field.setFrame(NSRect::new(
         NSPoint::new(24.0, 24.0),
-        NSSize::new(width - 48.0, frame.size.height.max(640.0) - 124.0),
+        NSSize::new(width - 48.0, document_height - 124.0),
     ));
     field.setFont(Some(&NSFont::systemFontOfSize(13.0)));
     field.setTextColor(Some(&NSColor::labelColor()));
@@ -51,13 +54,10 @@ pub fn new(
 
     let document = NSView::initWithFrame(
         NSView::alloc(mtm),
-        NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(width, frame.size.height.max(640.0)),
-        ),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, document_height)),
     );
     document.addSubview(&field);
-    let action_y = frame.size.height.max(640.0) - 48.0;
+    let action_y = document_height - 48.0;
     let new_proposal = ClickView::new(
         mtm,
         NSRect::new(NSPoint::new(16.0, action_y), NSSize::new(96.0, 32.0)),
@@ -144,13 +144,52 @@ fn content(context: &WorkContext) -> String {
     for proposal in &context.state.approved_proposals {
         text.push_str(&format!("{} · Decision recorded\n", proposal.title));
     }
-    text.push_str("\nEXECUTING\n");
-    for assignment in &context.state.active_assignments {
+    text.push_str("\nASSIGNED\n");
+    for assignment in &context.state.assigned {
         text.push_str(&format!("{}\n", assignment.instruction));
     }
-    text.push_str("\nRECENT RESULTS\n");
-    for turn in &context.state.recent_results {
-        text.push_str(&format!("{}\n", turn.content));
+    for (heading, executions) in [
+        ("ACTIVE EXECUTIONS", &context.state.active_executions),
+        ("STALE EXECUTIONS", &context.state.stale_executions),
+        ("COMPLETED WORK", &context.state.completed_executions),
+        ("FAILED WORK", &context.state.failed_executions),
+        ("CANCELLED WORK", &context.state.cancelled_executions),
+    ] {
+        text.push_str(&format!("\n{heading}\n"));
+        for execution in executions {
+            let assignment = context
+                .assignments
+                .iter()
+                .find(|assignment| assignment.id == execution.assignment_id);
+            let result = execution
+                .result_id
+                .as_ref()
+                .and_then(|id| context.results.iter().find(|result| result.id == *id));
+            text.push_str(&format!(
+                "{:?} · {}\nAssignment {} · {}\nProvider {}{}\nResult {}{}\n",
+                execution.status,
+                assignment
+                    .map(|assignment| assignment.instruction.as_str())
+                    .unwrap_or("Execution"),
+                execution.assignment_id,
+                execution.participant_id,
+                execution.provider,
+                execution
+                    .provider_execution_id
+                    .as_ref()
+                    .map(|id| format!(" · {id}"))
+                    .unwrap_or_default(),
+                result
+                    .and_then(|result| result.summary.as_deref())
+                    .or(execution.result_id.as_deref())
+                    .unwrap_or("none"),
+                execution
+                    .failure
+                    .as_ref()
+                    .map(|failure| format!(" · {failure}"))
+                    .unwrap_or_default()
+            ));
+        }
     }
     text.push_str("\nDECISIONS\n");
     for decision in &context.decisions {

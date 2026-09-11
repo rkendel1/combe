@@ -1,8 +1,8 @@
 use crate::{
     ArtifactId, AssignmentId, ConversationId, Participant, ParticipantId, ParticipantResult,
     ProposalId, ProposalReview, ProposalStatus, Result, ReviewId, TurnId, Work, WorkArtifact,
-    WorkAssignment, WorkContext, WorkConversation, WorkDecision, WorkId, WorkProposal, WorkStatus,
-    WorkTurn,
+    WorkAssignment, WorkContext, WorkConversation, WorkDecision, WorkExecution, WorkId,
+    WorkProposal, WorkStatus, WorkTurn,
 };
 
 pub const CONTEXT_TURN_LIMIT: usize = 50;
@@ -12,6 +12,10 @@ pub const CONTEXT_TEXT_LIMIT: usize = 16 * 1024;
 pub const CONTEXT_CONVERSATION_LIMIT: usize = 100;
 pub const CONTEXT_PROPOSAL_LIMIT: usize = 100;
 pub const CONTEXT_REVIEW_LIMIT: usize = 100;
+pub const CONTEXT_EXECUTION_LIMIT: usize = 100;
+pub const CONTEXT_ASSIGNMENT_LIMIT: usize = 100;
+pub const CONTEXT_RESULT_LIMIT: usize = 100;
+pub const EXECUTION_STALE_AFTER_MINUTES: i64 = 15;
 
 pub trait WorkStore: Send + Sync {
     fn create_work(&self, work: Work, participants: Vec<Participant>) -> Result<()>;
@@ -24,28 +28,11 @@ pub trait WorkStore: Send + Sync {
     fn turns(&self, work_id: &WorkId) -> Result<Vec<WorkTurn>>;
     fn add_assignment(&self, assignment: WorkAssignment) -> Result<()>;
     fn assignments(&self, work_id: &WorkId) -> Result<Vec<WorkAssignment>>;
-    fn set_assignment_status(
-        &self,
-        id: &AssignmentId,
-        status: crate::AssignmentStatus,
-    ) -> Result<WorkAssignment>;
+    fn load_assignment(&self, id: &AssignmentId) -> Result<Option<WorkAssignment>>;
     fn record_decision(&self, decision: WorkDecision, turn: Option<WorkTurn>) -> Result<()>;
     fn decisions(&self, work_id: &WorkId) -> Result<Vec<WorkDecision>>;
     fn add_artifact(&self, artifact: WorkArtifact) -> Result<()>;
     fn artifacts(&self, work_id: &WorkId) -> Result<Vec<WorkArtifact>>;
-    fn complete_assignment(
-        &self,
-        assignment: WorkAssignment,
-        turn: WorkTurn,
-        artifacts: Vec<WorkArtifact>,
-    ) -> Result<()>;
-    fn finish_assignment(
-        &self,
-        assignment: WorkAssignment,
-        result: ParticipantResult,
-        turn: WorkTurn,
-        artifacts: Vec<WorkArtifact>,
-    ) -> Result<()>;
     fn context(&self, work_id: &WorkId) -> Result<WorkContext>;
     fn find_participant(&self, work_id: &WorkId, name: &str) -> Result<Option<Participant>> {
         Ok(self
@@ -80,4 +67,20 @@ pub trait WorkStore: Send + Sync {
     ) -> Result<(WorkProposal, Option<WorkDecision>)>;
     fn reviews(&self, proposal_id: &ProposalId) -> Result<Vec<ProposalReview>>;
     fn load_review(&self, id: &ReviewId) -> Result<Option<ProposalReview>>;
+    fn start_execution(&self, execution: WorkExecution) -> Result<WorkExecution>;
+    fn heartbeat_execution(
+        &self,
+        id: &crate::ExecutionId,
+        at: crate::Timestamp,
+    ) -> Result<WorkExecution>;
+    fn finish_execution(
+        &self,
+        execution: WorkExecution,
+        result: Option<ParticipantResult>,
+        turn: Option<WorkTurn>,
+        artifacts: Vec<WorkArtifact>,
+    ) -> Result<WorkExecution>;
+    fn executions(&self, work_id: &WorkId) -> Result<Vec<WorkExecution>>;
+    fn load_execution(&self, id: &crate::ExecutionId) -> Result<Option<WorkExecution>>;
+    fn execution_for_assignment(&self, id: &AssignmentId) -> Result<Option<WorkExecution>>;
 }

@@ -9,6 +9,8 @@ A Work is durable coordination state, not a transcript. Its current projection a
 - A Proposal review is an explicit evaluation: approve, reject, or request changes.
 - A Decision is the authoritative conclusion created when a Proposal is approved.
 - An Assignment is authorized work for a participant to perform. When linked to a Proposal, that Proposal must already be approved.
+- An Execution is one durable provider-neutral materialization of an Assignment.
+- An execution result is the bounded outcome of that Execution.
 - An Artifact is repository-owned evidence or output of performed work.
 
 Proposal, review, and decision are separate because conversational agreement is not authorization. Approval atomically persists the review, changes the Proposal to Approved, and creates its Decision. Rejection atomically persists the review and changes the Proposal to Rejected. Requesting changes persists the review while leaving the Proposal Proposed.
@@ -19,7 +21,9 @@ Draft Proposals may be prepared before they are Proposed. Review operations appl
 
 The preserved chain is:
 
-`Proposal → Proposal review → Decision → Assignment → Turn/result → Artifacts`
+`Proposal → Proposal review → Decision → Assignment → Execution → result/Turn → Artifacts`
+
+An Assignment remains Pending until execution starts. Start atomically creates its sole canonical Execution and makes the Assignment Active. Completion, failure, or cancellation is an explicit fenced terminal transition. Provider IDs are external references; Work IDs and Execution IDs remain canonical.
 
 ## External participants
 

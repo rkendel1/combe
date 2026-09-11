@@ -8,15 +8,16 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::work_store::{
-    CONTEXT_ARTIFACT_LIMIT, CONTEXT_CONVERSATION_LIMIT, CONTEXT_DECISION_LIMIT,
-    CONTEXT_PROPOSAL_LIMIT, CONTEXT_REVIEW_LIMIT, CONTEXT_TEXT_LIMIT, CONTEXT_TURN_LIMIT,
+    CONTEXT_ARTIFACT_LIMIT, CONTEXT_ASSIGNMENT_LIMIT, CONTEXT_CONVERSATION_LIMIT,
+    CONTEXT_DECISION_LIMIT, CONTEXT_EXECUTION_LIMIT, CONTEXT_PROPOSAL_LIMIT, CONTEXT_RESULT_LIMIT,
+    CONTEXT_REVIEW_LIMIT, CONTEXT_TEXT_LIMIT, CONTEXT_TURN_LIMIT, EXECUTION_STALE_AFTER_MINUTES,
 };
 use crate::{
-    ArtifactId, AssignmentId, AssignmentStatus, ConversationId, Participant, ParticipantId,
-    ParticipantResult, ProposalId, ProposalReview, ProposalStatus, Result, ReviewId, ReviewOutcome,
-    StateError, TurnId, TurnOrigin, Work, WorkArtifact, WorkAssignment, WorkContext,
-    WorkConversation, WorkDecision, WorkId, WorkProposal, WorkState, WorkStatus, WorkStore,
-    WorkTurn,
+    ArtifactId, AssignmentId, AssignmentStatus, ConversationId, ExecutionId, ExecutionStatus,
+    Participant, ParticipantId, ParticipantResult, ProposalId, ProposalReview, ProposalStatus,
+    Result, ReviewId, ReviewOutcome, StateError, TurnId, TurnOrigin, Work, WorkArtifact,
+    WorkAssignment, WorkContext, WorkConversation, WorkDecision, WorkExecution, WorkId,
+    WorkProposal, WorkState, WorkStatus, WorkStore, WorkTurn,
 };
 
 pub struct FeltDbWorkStore {
@@ -276,6 +277,11 @@ impl WorkStore for FeltDbWorkStore {
 
     fn add_assignment(&self, assignment: WorkAssignment) -> Result<()> {
         self.require_work(&assignment.work_id)?;
+        if assignment.status != AssignmentStatus::Pending {
+            return Err(StateError::InvalidEntity(
+                "new assignment must be pending".into(),
+            ));
+        }
         self.validate_participant(&assignment.work_id, &assignment.from_participant_id)?;
         self.validate_participant(&assignment.work_id, &assignment.to_participant_id)?;
         if let Some(proposal_id) = &assignment.proposal_id {
@@ -306,20 +312,8 @@ impl WorkStore for FeltDbWorkStore {
         Ok(values)
     }
 
-    fn set_assignment_status(
-        &self,
-        id: &AssignmentId,
-        status: AssignmentStatus,
-    ) -> Result<WorkAssignment> {
-        let mut assignment = self
-            .get::<WorkAssignment>("assignment", &id.0)?
-            .ok_or_else(|| StateError::NotFound {
-                entity_type: "assignment".into(),
-                id: id.0.clone(),
-            })?;
-        assignment.status = status;
-        self.insert("assignment", &id.0, &assignment)?;
-        Ok(assignment)
+    fn load_assignment(&self, id: &AssignmentId) -> Result<Option<WorkAssignment>> {
+        self.get("assignment", &id.0)
     }
 
     fn record_decision(&self, decision: WorkDecision, turn: Option<WorkTurn>) -> Result<()> {
@@ -369,88 +363,6 @@ impl WorkStore for FeltDbWorkStore {
         Ok(values)
     }
 
-    fn complete_assignment(
-        &self,
-        assignment: WorkAssignment,
-        turn: WorkTurn,
-        artifacts: Vec<WorkArtifact>,
-    ) -> Result<()> {
-        if assignment.status != AssignmentStatus::Completed
-            || turn.work_id != assignment.work_id
-            || turn.participant_id != assignment.to_participant_id
-        {
-            return Err(StateError::InvalidEntity(
-                "assignment completion provenance does not match".into(),
-            ));
-        }
-        self.validate_participant(&assignment.work_id, &assignment.to_participant_id)?;
-        if artifacts.iter().any(|artifact| {
-            artifact.work_id != assignment.work_id
-                || artifact.created_by != assignment.to_participant_id
-        }) {
-            return Err(StateError::InvalidEntity(
-                "assignment artifact provenance does not match".into(),
-            ));
-        }
-        let mut mutations = vec![
-            Self::mutation("assignment", &assignment.id.0, &assignment)?,
-            Self::mutation("turn", &turn.id.0, &turn)?,
-        ];
-        let mut preconditions = vec![Self::absent("turn", &turn.id.0)];
-        for artifact in artifacts {
-            mutations.push(Self::mutation("artifact", &artifact.id.0, &artifact)?);
-            preconditions.push(Self::absent("artifact", &artifact.id.0));
-        }
-        self.atomic(mutations, preconditions)
-    }
-
-    fn finish_assignment(
-        &self,
-        assignment: WorkAssignment,
-        result: ParticipantResult,
-        turn: WorkTurn,
-        artifacts: Vec<WorkArtifact>,
-    ) -> Result<()> {
-        if !matches!(
-            assignment.status,
-            AssignmentStatus::Completed | AssignmentStatus::Failed
-        ) || result.work_id != assignment.work_id
-            || result.assignment_id != assignment.id
-            || result.participant_id != assignment.to_participant_id
-            || turn.work_id != assignment.work_id
-            || turn.participant_id != assignment.to_participant_id
-            || turn.assignment_id.as_ref() != Some(&assignment.id)
-            || turn.execution_id.as_deref() != Some(result.execution_id.as_str())
-        {
-            return Err(StateError::InvalidEntity(
-                "participant result provenance does not match assignment".into(),
-            ));
-        }
-        self.validate_participant(&assignment.work_id, &assignment.to_participant_id)?;
-        if artifacts.iter().any(|artifact| {
-            artifact.work_id != assignment.work_id
-                || artifact.created_by != assignment.to_participant_id
-        }) {
-            return Err(StateError::InvalidEntity(
-                "result artifact provenance does not match".into(),
-            ));
-        }
-        let mut mutations = vec![
-            Self::mutation("assignment", &assignment.id.0, &assignment)?,
-            Self::mutation("result", &result.id, &result)?,
-            Self::mutation("turn", &turn.id.0, &turn)?,
-        ];
-        let mut preconditions = vec![
-            Self::absent("result", &result.id),
-            Self::absent("turn", &turn.id.0),
-        ];
-        for artifact in artifacts {
-            mutations.push(Self::mutation("artifact", &artifact.id.0, &artifact)?);
-            preconditions.push(Self::absent("artifact", &artifact.id.0));
-        }
-        self.atomic(mutations, preconditions)
-    }
-
     fn context(&self, work_id: &WorkId) -> Result<WorkContext> {
         let work = self.require_work(work_id)?;
         let participants = self.participants(work_id)?;
@@ -467,8 +379,18 @@ impl WorkStore for FeltDbWorkStore {
                 turn
             })
             .collect::<Vec<_>>();
-        let active_assignments = self
+        let assignments = self
             .assignments(work_id)?
+            .into_iter()
+            .rev()
+            .take(CONTEXT_ASSIGNMENT_LIMIT)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        let active_assignments = assignments
+            .iter()
+            .cloned()
             .into_iter()
             .filter(|assignment| {
                 matches!(
@@ -552,7 +474,50 @@ impl WorkStore for FeltDbWorkStore {
                 .filter(|turn| turn.assignment_id.is_some() && turn.execution_id.is_some())
                 .cloned()
                 .collect(),
+            assigned: active_assignments
+                .iter()
+                .filter(|assignment| assignment.status == AssignmentStatus::Pending)
+                .cloned()
+                .collect(),
+            active_executions: Vec::new(),
+            stale_executions: Vec::new(),
+            completed_executions: Vec::new(),
+            failed_executions: Vec::new(),
+            cancelled_executions: Vec::new(),
         };
+        let executions = self
+            .executions(work_id)?
+            .into_iter()
+            .rev()
+            .take(CONTEXT_EXECUTION_LIMIT)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        let stale_before = Utc::now() - chrono::Duration::minutes(EXECUTION_STALE_AFTER_MINUTES);
+        let mut state = state;
+        for execution in &executions {
+            match execution.status {
+                ExecutionStatus::Started => {
+                    if execution.heartbeat_at.unwrap_or(execution.started_at) < stale_before {
+                        state.stale_executions.push(execution.clone());
+                    } else {
+                        state.active_executions.push(execution.clone());
+                    }
+                }
+                ExecutionStatus::Completed => state.completed_executions.push(execution.clone()),
+                ExecutionStatus::Failed => state.failed_executions.push(execution.clone()),
+                ExecutionStatus::Cancelled => state.cancelled_executions.push(execution.clone()),
+            }
+        }
+        let mut results = executions
+            .iter()
+            .rev()
+            .filter_map(|execution| execution.result_id.as_deref())
+            .take(CONTEXT_RESULT_LIMIT)
+            .filter_map(|id| self.load_result(id).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        results.reverse();
         Ok(WorkContext {
             work,
             participants,
@@ -564,6 +529,9 @@ impl WorkStore for FeltDbWorkStore {
             proposals,
             reviews,
             state,
+            executions,
+            assignments,
+            results,
         })
     }
 
@@ -760,6 +728,218 @@ impl WorkStore for FeltDbWorkStore {
     fn load_review(&self, id: &ReviewId) -> Result<Option<ProposalReview>> {
         self.get("proposal-review", &id.0)
     }
+
+    fn start_execution(&self, execution: WorkExecution) -> Result<WorkExecution> {
+        if let Some(existing) = self.execution_for_assignment(&execution.assignment_id)? {
+            return Ok(existing);
+        }
+        if execution.status != ExecutionStatus::Started
+            || execution.completed_at.is_some()
+            || execution.result_id.is_some()
+            || execution.failure.is_some()
+            || execution.provider.trim().is_empty()
+        {
+            return Err(StateError::InvalidEntity(
+                "new execution must be a valid started execution".into(),
+            ));
+        }
+        let assignment_version = self.version("assignment", &execution.assignment_id.0)?;
+        let mut assignment = self
+            .get::<WorkAssignment>("assignment", &execution.assignment_id.0)?
+            .ok_or_else(|| StateError::NotFound {
+                entity_type: "assignment".into(),
+                id: execution.assignment_id.0.clone(),
+            })?;
+        if assignment.status != AssignmentStatus::Pending
+            || assignment.work_id != execution.work_id
+            || assignment.to_participant_id != execution.participant_id
+        {
+            return Err(StateError::InvalidEntity(
+                "assignment is not authorized to start this execution".into(),
+            ));
+        }
+        self.validate_participant(&execution.work_id, &execution.participant_id)?;
+        assignment.status = AssignmentStatus::Active;
+        self.atomic(
+            vec![
+                Self::mutation("assignment", &assignment.id.0, &assignment)?,
+                Self::mutation("execution", &execution.id.0, &execution)?,
+            ],
+            vec![
+                Self::at_version("assignment", &assignment.id.0, assignment_version),
+                Self::absent("execution", &execution.id.0),
+            ],
+        )?;
+        Ok(execution)
+    }
+
+    fn heartbeat_execution(
+        &self,
+        id: &ExecutionId,
+        at: chrono::DateTime<Utc>,
+    ) -> Result<WorkExecution> {
+        let version = self.version("execution", &id.0)?;
+        let mut execution = self
+            .load_execution(id)?
+            .ok_or_else(|| StateError::NotFound {
+                entity_type: "execution".into(),
+                id: id.0.clone(),
+            })?;
+        if execution.status != ExecutionStatus::Started {
+            return Err(StateError::InvalidEntity(
+                "only a started execution accepts heartbeats".into(),
+            ));
+        }
+        execution.heartbeat_at = Some(at);
+        execution.updated_at = at;
+        self.atomic(
+            vec![Self::mutation("execution", &execution.id.0, &execution)?],
+            vec![Self::at_version("execution", &execution.id.0, version)],
+        )?;
+        Ok(execution)
+    }
+
+    fn finish_execution(
+        &self,
+        mut execution: WorkExecution,
+        result: Option<ParticipantResult>,
+        turn: Option<WorkTurn>,
+        artifacts: Vec<WorkArtifact>,
+    ) -> Result<WorkExecution> {
+        let existing = self
+            .load_execution(&execution.id)?
+            .ok_or_else(|| StateError::NotFound {
+                entity_type: "execution".into(),
+                id: execution.id.0.clone(),
+            })?;
+        if existing.status != ExecutionStatus::Started {
+            if existing.status == execution.status {
+                return Ok(existing);
+            }
+            return Err(StateError::InvalidEntity(
+                "execution is already terminal".into(),
+            ));
+        }
+        if !matches!(
+            execution.status,
+            ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
+        ) || execution.assignment_id != existing.assignment_id
+            || execution.work_id != existing.work_id
+            || execution.participant_id != existing.participant_id
+            || execution.provider != existing.provider
+            || existing.provider_execution_id.is_some()
+                && execution.provider_execution_id != existing.provider_execution_id
+        {
+            return Err(StateError::InvalidEntity(
+                "execution terminal provenance does not match".into(),
+            ));
+        }
+        let execution_version = self.version("execution", &execution.id.0)?;
+        let assignment_version = self.version("assignment", &execution.assignment_id.0)?;
+        let mut assignment = self
+            .get::<WorkAssignment>("assignment", &execution.assignment_id.0)?
+            .ok_or_else(|| StateError::NotFound {
+                entity_type: "assignment".into(),
+                id: execution.assignment_id.0.clone(),
+            })?;
+        if assignment.status != AssignmentStatus::Active {
+            return Err(StateError::InvalidEntity(
+                "execution assignment is not active".into(),
+            ));
+        }
+        let needs_result = matches!(
+            execution.status,
+            ExecutionStatus::Completed | ExecutionStatus::Failed
+        );
+        if needs_result != result.is_some() || needs_result != turn.is_some() {
+            return Err(StateError::InvalidEntity(
+                "completed and failed executions require one result and turn".into(),
+            ));
+        }
+        if let (Some(result), Some(turn)) = (&result, &turn) {
+            if result.work_id != execution.work_id
+                || result.assignment_id != execution.assignment_id
+                || result.participant_id != execution.participant_id
+                || result.execution_id != execution.id.0
+                || turn.work_id != execution.work_id
+                || turn.participant_id != execution.participant_id
+                || turn.assignment_id.as_ref() != Some(&execution.assignment_id)
+                || turn.execution_id.as_deref() != Some(execution.id.0.as_str())
+            {
+                return Err(StateError::InvalidEntity(
+                    "execution result provenance does not match".into(),
+                ));
+            }
+            validate_contribution(&turn.content)?;
+            if result
+                .output
+                .as_ref()
+                .is_some_and(|output| output.len() > CONTEXT_TEXT_LIMIT)
+            {
+                return Err(StateError::InvalidEntity(
+                    "execution result exceeds the context text limit".into(),
+                ));
+            }
+            execution.result_id = Some(result.id.clone());
+        }
+        if artifacts.iter().any(|artifact| {
+            artifact.work_id != execution.work_id || artifact.created_by != execution.participant_id
+        }) {
+            return Err(StateError::InvalidEntity(
+                "execution artifact provenance does not match".into(),
+            ));
+        }
+        assignment.status = match execution.status {
+            ExecutionStatus::Completed => AssignmentStatus::Completed,
+            ExecutionStatus::Failed => AssignmentStatus::Failed,
+            ExecutionStatus::Cancelled => AssignmentStatus::Cancelled,
+            ExecutionStatus::Started => unreachable!(),
+        };
+        let mut mutations = vec![
+            Self::mutation("assignment", &assignment.id.0, &assignment)?,
+            Self::mutation("execution", &execution.id.0, &execution)?,
+        ];
+        let mut preconditions = vec![
+            Self::at_version("assignment", &assignment.id.0, assignment_version),
+            Self::at_version("execution", &execution.id.0, execution_version),
+        ];
+        if let Some(result) = result {
+            mutations.push(Self::mutation("result", &result.id, &result)?);
+            preconditions.push(Self::absent("result", &result.id));
+        }
+        if let Some(turn) = turn {
+            mutations.push(Self::mutation("turn", &turn.id.0, &turn)?);
+            preconditions.push(Self::absent("turn", &turn.id.0));
+        }
+        for artifact in artifacts {
+            mutations.push(Self::mutation("artifact", &artifact.id.0, &artifact)?);
+            preconditions.push(Self::absent("artifact", &artifact.id.0));
+        }
+        self.atomic(mutations, preconditions)?;
+        Ok(execution)
+    }
+
+    fn executions(&self, work_id: &WorkId) -> Result<Vec<WorkExecution>> {
+        let mut values: Vec<WorkExecution> = self.scan("execution")?;
+        values.retain(|value| value.work_id == *work_id);
+        values.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.id.0.cmp(&right.id.0))
+        });
+        Ok(values)
+    }
+
+    fn load_execution(&self, id: &ExecutionId) -> Result<Option<WorkExecution>> {
+        self.get("execution", &id.0)
+    }
+
+    fn execution_for_assignment(&self, id: &AssignmentId) -> Result<Option<WorkExecution>> {
+        Ok(self
+            .scan::<WorkExecution>("execution")?
+            .into_iter()
+            .find(|execution| execution.assignment_id == *id))
+    }
 }
 
 fn validate_contribution(value: &str) -> Result<()> {
@@ -895,9 +1075,6 @@ mod tests {
             proposal_id: None,
         };
         store.add_assignment(assignment.clone()).unwrap();
-        store
-            .set_assignment_status(&assignment.id, AssignmentStatus::Active)
-            .unwrap();
         let decision = WorkDecision {
             id: DecisionId::new(),
             work_id: work.id.clone(),
@@ -933,123 +1110,6 @@ mod tests {
         assert_eq!(context.active_assignments.len(), 1);
         assert_eq!(context.decisions.len(), 1);
         assert_eq!(context.artifacts.len(), 1);
-        assert_eq!(
-            store
-                .set_assignment_status(&assignment.id, AssignmentStatus::Cancelled)
-                .unwrap()
-                .status,
-            AssignmentStatus::Cancelled
-        );
-    }
-
-    #[test]
-    fn assignment_completion_is_atomic_and_rejects_partial_invalid_input() {
-        let (store, _directory) = store();
-        let (work, human, agent) = work_with_participants(&store);
-        let assignment = WorkAssignment {
-            id: AssignmentId::new(),
-            work_id: work.id.clone(),
-            from_participant_id: human.id,
-            to_participant_id: agent.id.clone(),
-            instruction: "Implement".into(),
-            status: AssignmentStatus::Pending,
-            created_at: Utc::now(),
-            proposal_id: None,
-        };
-        store.add_assignment(assignment.clone()).unwrap();
-        let turn = WorkTurn {
-            id: TurnId::new(),
-            work_id: work.id.clone(),
-            participant_id: agent.id.clone(),
-            kind: TurnKind::Implementation,
-            content: "Done".into(),
-            created_at: Utc::now(),
-            assignment_id: None,
-            execution_id: None,
-            origin: TurnOrigin::Local,
-        };
-        let artifact = WorkArtifact {
-            id: ArtifactId::new(),
-            work_id: work.id.clone(),
-            kind: ArtifactKind::Patch,
-            path: Some("change.patch".into()),
-            description: None,
-            created_by: agent.id,
-            created_at: Utc::now(),
-        };
-        assert!(
-            store
-                .complete_assignment(assignment.clone(), turn.clone(), vec![artifact.clone()])
-                .is_err()
-        );
-        assert!(store.load_turn(&turn.id).unwrap().is_none());
-        assert!(store.load_artifact(&artifact.id).unwrap().is_none());
-        let mut completed = assignment;
-        completed.status = AssignmentStatus::Completed;
-        store
-            .complete_assignment(completed, turn.clone(), vec![artifact.clone()])
-            .unwrap();
-        assert!(store.load_turn(&turn.id).unwrap().is_some());
-        assert!(store.load_artifact(&artifact.id).unwrap().is_some());
-    }
-
-    #[test]
-    fn participant_result_and_provenance_turn_persist_after_reopen() {
-        let directory = TempDir::new().unwrap();
-        let path = directory.path().join("work.db");
-        let (work_id, turn_id) = {
-            let store = FeltDbWorkStore::open(&path).unwrap();
-            let (work, human, agent) = work_with_participants(&store);
-            let assignment = WorkAssignment {
-                id: AssignmentId::new(),
-                work_id: work.id.clone(),
-                from_participant_id: human.id,
-                to_participant_id: agent.id.clone(),
-                instruction: "Review".into(),
-                status: AssignmentStatus::Failed,
-                created_at: Utc::now(),
-                proposal_id: None,
-            };
-            store.add_assignment(assignment.clone()).unwrap();
-            let execution_id = "execution-1".to_string();
-            let result = ParticipantResult {
-                id: "result-1".into(),
-                work_id: work.id.clone(),
-                participant_id: agent.id.clone(),
-                assignment_id: assignment.id.clone(),
-                execution_id: execution_id.clone(),
-                exit_status: Some(7),
-                summary: Some("review failed".into()),
-                output: Some("details".into()),
-                created_at: Utc::now(),
-            };
-            let turn = WorkTurn {
-                id: TurnId::new(),
-                work_id: work.id.clone(),
-                participant_id: agent.id,
-                kind: TurnKind::Review,
-                content: "details".into(),
-                created_at: Utc::now(),
-                assignment_id: Some(assignment.id.clone()),
-                execution_id: Some(execution_id),
-                origin: TurnOrigin::Local,
-            };
-            store
-                .finish_assignment(assignment, result, turn.clone(), Vec::new())
-                .unwrap();
-            (work.id, turn.id)
-        };
-        let store = FeltDbWorkStore::open(&path).unwrap();
-        let turn = store.load_turn(&turn_id).unwrap().unwrap();
-        assert_eq!(turn.execution_id.as_deref(), Some("execution-1"));
-        assert_eq!(
-            store.load_result("result-1").unwrap().unwrap().exit_status,
-            Some(7)
-        );
-        assert_eq!(
-            store.assignments(&work_id).unwrap()[0].status,
-            AssignmentStatus::Failed
-        );
     }
 
     #[test]
@@ -1389,5 +1449,314 @@ mod tests {
         assert_eq!(context.reviews[0].reviewed_by, human.id);
         assert_eq!(decision.unwrap().review_id, Some(approval.id));
         assert_eq!(context.active_assignments[0].proposal_id, Some(proposed.id));
+    }
+
+    fn assigned_execution(
+        store: &FeltDbWorkStore,
+    ) -> (Work, Participant, WorkAssignment, WorkExecution) {
+        let (work, human, agent) = work_with_participants(store);
+        let assignment = WorkAssignment {
+            id: AssignmentId::new(),
+            work_id: work.id.clone(),
+            from_participant_id: human.id,
+            to_participant_id: agent.id.clone(),
+            instruction: "Perform authorized work".into(),
+            status: AssignmentStatus::Pending,
+            created_at: Utc::now(),
+            proposal_id: None,
+        };
+        store.add_assignment(assignment.clone()).unwrap();
+        let now = Utc::now();
+        let execution = WorkExecution {
+            id: ExecutionId::new(),
+            work_id: work.id.clone(),
+            assignment_id: assignment.id.clone(),
+            participant_id: agent.id.clone(),
+            provider: "test-provider".into(),
+            provider_execution_id: Some("provider-42".into()),
+            status: ExecutionStatus::Started,
+            started_at: now,
+            completed_at: None,
+            heartbeat_at: Some(now),
+            result_id: None,
+            failure: None,
+            created_at: now,
+            updated_at: now,
+        };
+        (work, agent, assignment, execution)
+    }
+
+    fn terminal_records(
+        work: &Work,
+        participant: &Participant,
+        execution: &WorkExecution,
+        exit_status: Option<i32>,
+    ) -> (ParticipantResult, WorkTurn) {
+        let now = Utc::now();
+        (
+            ParticipantResult {
+                id: Uuid::new_v4().to_string(),
+                work_id: work.id.clone(),
+                participant_id: participant.id.clone(),
+                assignment_id: execution.assignment_id.clone(),
+                execution_id: execution.id.0.clone(),
+                exit_status,
+                summary: Some("outcome".into()),
+                output: Some("bounded outcome".into()),
+                created_at: now,
+            },
+            WorkTurn {
+                id: TurnId::new(),
+                work_id: work.id.clone(),
+                participant_id: participant.id.clone(),
+                kind: TurnKind::Implementation,
+                content: "bounded outcome".into(),
+                created_at: now,
+                assignment_id: Some(execution.assignment_id.clone()),
+                execution_id: Some(execution.id.0.clone()),
+                origin: TurnOrigin::Local,
+            },
+        )
+    }
+
+    #[test]
+    fn execution_start_and_completion_are_fenced_idempotent_and_durable() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("work.db");
+        let (work_id, assignment_id, execution_id, result_id) = {
+            let store = FeltDbWorkStore::open(&path).unwrap();
+            let (work, agent, assignment, execution) = assigned_execution(&store);
+            let started = store.start_execution(execution.clone()).unwrap();
+            let duplicate = store
+                .start_execution(WorkExecution {
+                    id: ExecutionId::new(),
+                    ..execution.clone()
+                })
+                .unwrap();
+            assert_eq!(duplicate.id, started.id);
+            assert_eq!(
+                store
+                    .load_assignment(&assignment.id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                AssignmentStatus::Active
+            );
+            let (result, turn) = terminal_records(&work, &agent, &started, Some(0));
+            let result_id = result.id.clone();
+            let mut completed = started.clone();
+            completed.status = ExecutionStatus::Completed;
+            completed.completed_at = Some(Utc::now());
+            completed.updated_at = Utc::now();
+            let completed = store
+                .finish_execution(completed.clone(), Some(result), Some(turn), Vec::new())
+                .unwrap();
+            assert_eq!(
+                store
+                    .finish_execution(completed.clone(), None, None, Vec::new())
+                    .unwrap(),
+                completed
+            );
+            assert_eq!(
+                store
+                    .load_assignment(&assignment.id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                AssignmentStatus::Completed
+            );
+            (work.id, assignment.id, completed.id, result_id)
+        };
+        let store = FeltDbWorkStore::open(path).unwrap();
+        let execution = store.load_execution(&execution_id).unwrap().unwrap();
+        assert_eq!(execution.status, ExecutionStatus::Completed);
+        assert_eq!(execution.result_id.as_deref(), Some(result_id.as_str()));
+        assert!(store.load_result(&result_id).unwrap().is_some());
+        let context = store.context(&work_id).unwrap();
+        assert_eq!(context.executions.len(), 1);
+        assert_eq!(context.results[0].id, result_id);
+        assert_eq!(
+            store
+                .load_assignment(&assignment_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            AssignmentStatus::Completed
+        );
+    }
+
+    #[test]
+    fn execution_failure_cancellation_and_invalid_transitions_are_explicit() {
+        let (store, _directory) = store();
+        let (work, agent, _, execution) = assigned_execution(&store);
+        let started = store.start_execution(execution).unwrap();
+        let (result, turn) = terminal_records(&work, &agent, &started, Some(1));
+        let mut failed = started.clone();
+        failed.status = ExecutionStatus::Failed;
+        failed.failure = Some("provider failed".into());
+        failed.completed_at = Some(Utc::now());
+        failed.updated_at = Utc::now();
+        store
+            .finish_execution(failed.clone(), Some(result), Some(turn), Vec::new())
+            .unwrap();
+        let mut contradictory = failed.clone();
+        contradictory.status = ExecutionStatus::Completed;
+        assert!(
+            store
+                .finish_execution(contradictory, None, None, Vec::new())
+                .is_err()
+        );
+
+        let (_, _, assignment, execution) = assigned_execution(&store);
+        let mut cancelled = store.start_execution(execution).unwrap();
+        cancelled.status = ExecutionStatus::Cancelled;
+        cancelled.failure = Some("cancelled by human".into());
+        cancelled.completed_at = Some(Utc::now());
+        cancelled.updated_at = Utc::now();
+        store
+            .finish_execution(cancelled.clone(), None, None, Vec::new())
+            .unwrap();
+        assert_eq!(
+            store
+                .load_assignment(&assignment.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            AssignmentStatus::Cancelled
+        );
+        assert_eq!(
+            store
+                .finish_execution(cancelled.clone(), None, None, Vec::new())
+                .unwrap()
+                .status,
+            ExecutionStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn failed_execution_transaction_preserves_started_state() {
+        let (store, _directory) = store();
+        let (work, agent, assignment, execution) = assigned_execution(&store);
+        let started = store.start_execution(execution).unwrap();
+        let (result, turn) = terminal_records(&work, &agent, &started, Some(0));
+        store.insert("result", &result.id, &result).unwrap();
+        let mut completed = started.clone();
+        completed.status = ExecutionStatus::Completed;
+        completed.completed_at = Some(Utc::now());
+        completed.updated_at = Utc::now();
+        assert!(
+            store
+                .finish_execution(completed, Some(result), Some(turn.clone()), Vec::new())
+                .is_err()
+        );
+        assert_eq!(
+            store.load_execution(&started.id).unwrap().unwrap().status,
+            ExecutionStatus::Started
+        );
+        assert_eq!(
+            store
+                .load_assignment(&assignment.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            AssignmentStatus::Active
+        );
+        assert!(store.load_turn(&turn.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn execution_projection_derives_staleness_and_terminal_groups() {
+        let (store, _directory) = store();
+        let (work, _, _, mut execution) = assigned_execution(&store);
+        execution.started_at = Utc::now() - chrono::Duration::minutes(20);
+        execution.heartbeat_at = Some(execution.started_at);
+        execution.created_at = execution.started_at;
+        execution.updated_at = execution.started_at;
+        store.start_execution(execution).unwrap();
+        let context = store.context(&work.id).unwrap();
+        assert!(context.state.active_executions.is_empty());
+        assert_eq!(context.state.stale_executions.len(), 1);
+        let first = serde_json::to_vec(&context).unwrap();
+        let second = serde_json::to_vec(&store.context(&work.id).unwrap()).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn concurrent_execution_starts_create_one_canonical_record() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("work.db");
+        let first = FeltDbWorkStore::open(&path).unwrap();
+        let (_, _, assignment, execution) = assigned_execution(&first);
+        let second = FeltDbWorkStore::open(&path).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let run = |store: FeltDbWorkStore,
+                   mut execution: WorkExecution,
+                   barrier: std::sync::Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || {
+                execution.id = ExecutionId::new();
+                barrier.wait();
+                store.start_execution(execution)
+            })
+        };
+        let left = run(first, execution.clone(), barrier.clone());
+        let right = run(second, execution, barrier.clone());
+        barrier.wait();
+        let left = left.join().unwrap();
+        let right = right.join().unwrap();
+        assert!(left.is_ok() || right.is_ok());
+        let store = FeltDbWorkStore::open(path).unwrap();
+        assert_eq!(store.executions(&assignment.work_id).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .load_assignment(&assignment.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            AssignmentStatus::Active
+        );
+    }
+
+    #[test]
+    fn concurrent_completion_and_cancellation_choose_one_terminal_outcome() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("work.db");
+        let setup = FeltDbWorkStore::open(&path).unwrap();
+        let (work, agent, assignment, execution) = assigned_execution(&setup);
+        let started = setup.start_execution(execution).unwrap();
+        let completion_store = FeltDbWorkStore::open(&path).unwrap();
+        let cancellation_store = FeltDbWorkStore::open(&path).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let completion_barrier = barrier.clone();
+        let mut completed = started.clone();
+        let completion = std::thread::spawn(move || {
+            let (result, turn) = terminal_records(&work, &agent, &completed, Some(0));
+            completed.status = ExecutionStatus::Completed;
+            completed.completed_at = Some(Utc::now());
+            completed.updated_at = Utc::now();
+            completion_barrier.wait();
+            completion_store.finish_execution(completed, Some(result), Some(turn), Vec::new())
+        });
+        let cancellation_barrier = barrier.clone();
+        let mut cancelled = started.clone();
+        let cancellation = std::thread::spawn(move || {
+            cancelled.status = ExecutionStatus::Cancelled;
+            cancelled.failure = Some("cancelled by human".into());
+            cancelled.completed_at = Some(Utc::now());
+            cancelled.updated_at = Utc::now();
+            cancellation_barrier.wait();
+            cancellation_store.finish_execution(cancelled, None, None, Vec::new())
+        });
+        barrier.wait();
+        let completion = completion.join().unwrap();
+        let cancellation = cancellation.join().unwrap();
+        assert_ne!(completion.is_ok(), cancellation.is_ok());
+        let store = FeltDbWorkStore::open(path).unwrap();
+        let execution = store.load_execution(&started.id).unwrap().unwrap();
+        let assignment = store.load_assignment(&assignment.id).unwrap().unwrap();
+        assert!(matches!(
+            (execution.status, assignment.status),
+            (ExecutionStatus::Completed, AssignmentStatus::Completed)
+                | (ExecutionStatus::Cancelled, AssignmentStatus::Cancelled)
+        ));
     }
 }

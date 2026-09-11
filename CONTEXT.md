@@ -38,5 +38,8 @@ Use these words in code, commits, and docs. If a new domain word sticks, add it 
 | Proposal | A provider-neutral statement being considered by a Work, with explicit author, provenance, and lifecycle. |
 | Proposal review | A durable participant evaluation that approves, rejects, or requests changes to a Proposal. It is not itself authorization. |
 | Coordination state | The deterministic current-state projection of proposals, reviews, decisions, assignments, and recent results. |
+| Execution | One durable, provider-neutral materialization of an authorized Assignment, from start through one terminal outcome. |
+| Execution provider | A replaceable adapter that performs an Assignment and reports observations to canonical Work transitions. |
+| Execution result | The bounded canonical outcome of an Execution. Provider transcripts remain external. |
 
 Out of vocabulary: agent session, workbench, desk, execution host, orcad, theme, setting, preference pane.

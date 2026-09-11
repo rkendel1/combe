@@ -60,6 +60,10 @@ A Work is authoritative coordination state, not a transcript. Provider-neutral P
 
 The overview projects current coordination state before history: proposed work awaiting review, approved proposals and decisions, active execution, and recent results. Its restrained native actions enter visible `combe work proposal` and `combe work assign` commands in the focused terminal. Review, Approve, and Reject are explicit operations; no contribution or agent wording changes authoritative state automatically. The canonical text envelope is `COMBE_WORK_CONTEXT` version 2 and renders the same deterministic, bounded `WorkContext` used by stable JSON export and participant handoff.
 
+An Assignment authorizes work but does not prove that work began. A canonical provider-neutral Execution records the single materialization of that Assignment. Starting atomically changes the Assignment from Pending to Active and creates its Execution; completion, failure, and cancellation atomically update both records, with completion and failure retaining a bounded result and provenance. Provider execution IDs are external references. Repeated provider observations cannot create a second canonical Execution or contradictory terminal result.
+
+The Work overview derives Assigned, Active, Stale, Completed, Failed, and Cancelled groups from canonical Assignment and Execution records. Staleness is a timestamp-derived presentation state, not a persisted status or scheduler. Selecting an item exposes its proposal, approval, assignment, execution provider, terminal result, and provenance. Combe retains no UI-only execution cache and does not supervise hidden processes.
+
 ## Non-goals
 
 - Proprietary agents, provider chat overlays, automatic agent dispatch, provider authentication, or process supervision

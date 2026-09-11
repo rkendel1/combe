@@ -131,6 +131,15 @@ impl ContextPackage {
             context.state.active_assignments.len(),
             context.state.recent_results.len()
         ));
+        output.push_str(&format!(
+            "Assigned: {}\nActive executions: {}\nStale executions: {}\nCompleted executions: {}\nFailed executions: {}\nCancelled executions: {}\n",
+            context.state.assigned.len(),
+            context.state.active_executions.len(),
+            context.state.stale_executions.len(),
+            context.state.completed_executions.len(),
+            context.state.failed_executions.len(),
+            context.state.cancelled_executions.len()
+        ));
         output.push_str("\nPROPOSALS\n");
         for proposal in &context.proposals {
             output.push_str(&format!(
@@ -174,6 +183,29 @@ impl ContextPackage {
         output.push_str("\nRECENT RESULTS\n");
         for turn in &context.state.recent_results {
             output.push_str(&format!("- {}: {}\n", turn.participant_id, turn.content));
+        }
+        output.push_str("\nEXECUTIONS\n");
+        for execution in &context.executions {
+            output.push_str(&format!(
+                "- {} assignment={} status={:?} provider={} provider_execution={} result={} failure={}\n",
+                execution.id,
+                execution.assignment_id,
+                execution.status,
+                execution.provider,
+                execution.provider_execution_id.as_deref().unwrap_or(""),
+                execution.result_id.as_deref().unwrap_or(""),
+                execution.failure.as_deref().unwrap_or("")
+            ));
+        }
+        output.push_str("\nEXECUTION RESULTS\n");
+        for result in &context.results {
+            output.push_str(&format!(
+                "- {} execution={} exit={:?}: {}\n",
+                result.id,
+                result.execution_id,
+                result.exit_status,
+                result.summary.as_deref().unwrap_or("")
+            ));
         }
         output.push_str("\nCONSTRAINTS\n");
         for constraint in &self.constraints {
@@ -296,9 +328,10 @@ mod tests {
     use chrono::Utc;
     use combe_state::{
         AssignmentId, AssignmentStatus, ConversationId, ConversationProvider, ConversationRef,
-        FeltDbWorkStore, ParticipantId, ParticipantKind, ParticipantResult, ProposalId,
-        ProposalReview, ProposalStatus, ReviewId, ReviewOutcome, TurnId, TurnKind, TurnOrigin,
-        Work, WorkConversation, WorkId, WorkProposal, WorkStatus, WorkStore, WorkTurn,
+        ExecutionId, ExecutionStatus, FeltDbWorkStore, ParticipantId, ParticipantKind,
+        ParticipantResult, ProposalId, ProposalReview, ProposalStatus, ReviewId, ReviewOutcome,
+        TurnId, TurnKind, TurnOrigin, Work, WorkConversation, WorkExecution, WorkId, WorkProposal,
+        WorkStatus, WorkStore, WorkTurn,
     };
     use tempfile::TempDir;
 
@@ -355,7 +388,16 @@ mod tests {
                 approved_proposals: Vec::new(),
                 active_assignments: vec![assignment.clone()],
                 recent_results: Vec::new(),
+                assigned: Vec::new(),
+                active_executions: Vec::new(),
+                stale_executions: Vec::new(),
+                completed_executions: Vec::new(),
+                failed_executions: Vec::new(),
+                cancelled_executions: Vec::new(),
             },
+            executions: Vec::new(),
+            assignments: Vec::new(),
+            results: Vec::new(),
         };
         (directory, context, assignment, agent)
     }
@@ -376,6 +418,8 @@ mod tests {
         assert!(package.text().contains("\nPROPOSALS\n"));
         assert!(package.text().contains("\nPENDING REVIEWS\n"));
         assert!(package.text().contains("\nRECENT RESULTS\n"));
+        assert!(package.text().contains("\nEXECUTIONS\n"));
+        assert!(package.text().contains("\nEXECUTION RESULTS\n"));
         assert!(package.text().ends_with("END_COMBE_WORK_CONTEXT\n"));
     }
 
@@ -470,9 +514,6 @@ mod tests {
             .unwrap();
         assignment.proposal_id = Some(proposal.id.clone());
         store.add_assignment(assignment.clone()).unwrap();
-        assignment = store
-            .set_assignment_status(&assignment.id, AssignmentStatus::Active)
-            .unwrap();
         let adapter = LocalCliAdapter::discover(LocalProvider::Codex).unwrap();
         let prepared = adapter
             .prepare(
@@ -480,6 +521,25 @@ mod tests {
                 assignment.clone(),
                 &agent,
             )
+            .unwrap();
+        let started_at = Utc::now();
+        let mut execution = store
+            .start_execution(WorkExecution {
+                id: ExecutionId::new(),
+                work_id: assignment.work_id.clone(),
+                assignment_id: assignment.id.clone(),
+                participant_id: agent.id.clone(),
+                provider: "codex".into(),
+                provider_execution_id: None,
+                status: ExecutionStatus::Started,
+                started_at,
+                completed_at: None,
+                heartbeat_at: Some(started_at),
+                result_id: None,
+                failure: None,
+                created_at: started_at,
+                updated_at: started_at,
+            })
             .unwrap();
         assert!(prepared.package.text().contains("ChatGpt: ChatGPT"));
         assert!(
@@ -491,14 +551,17 @@ mod tests {
         let result = adapter.launch(prepared).unwrap();
         assert_eq!(result.exit_status, Some(0));
         assert!(result.stdout.contains("COMBE_HANDOFF_OK"));
-        assignment.status = AssignmentStatus::Completed;
         let now = Utc::now();
+        execution.status = ExecutionStatus::Completed;
+        execution.provider_execution_id = Some(result.execution_id);
+        execution.completed_at = Some(now);
+        execution.updated_at = now;
         let participant_result = ParticipantResult {
             id: "result-1".into(),
             work_id: assignment.work_id.clone(),
             participant_id: agent.id.clone(),
             assignment_id: assignment.id.clone(),
-            execution_id: result.execution_id.clone(),
+            execution_id: execution.id.0.clone(),
             exit_status: result.exit_status,
             summary: Some("COMBE_HANDOFF_OK".into()),
             output: Some(result.stdout.clone()),
@@ -512,11 +575,16 @@ mod tests {
             content: result.stdout,
             created_at: now,
             assignment_id: Some(assignment.id.clone()),
-            execution_id: Some(result.execution_id),
+            execution_id: Some(execution.id.0.clone()),
             origin: combe_state::TurnOrigin::Local,
         };
         store
-            .finish_assignment(assignment.clone(), participant_result, turn, Vec::new())
+            .finish_execution(
+                execution.clone(),
+                Some(participant_result),
+                Some(turn),
+                Vec::new(),
+            )
             .unwrap();
         drop(store);
         let reopened = FeltDbWorkStore::open(database_path).unwrap();
@@ -528,6 +596,8 @@ mod tests {
                 .any(|turn| turn.content.contains("COMBE_HANDOFF_OK"))
         );
         assert!(restored.active_assignments.is_empty());
+        assert_eq!(restored.executions[0].status, ExecutionStatus::Completed);
+        assert_eq!(restored.executions[0].assignment_id, assignment.id);
         assert_eq!(restored.conversations.len(), 1);
         assert_eq!(restored.state.approved_proposals.len(), 1);
         assert_eq!(restored.decisions[0].proposal_id, Some(proposal.id));

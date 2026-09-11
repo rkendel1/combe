@@ -12,10 +12,11 @@ use combe_catalog::{
 };
 use combe_state::{
     ArtifactId, ArtifactKind, AssignmentId, AssignmentStatus, ConversationId, ConversationProvider,
-    ConversationRef, FeltDbWorkStore, FeltDbWorkspaceStore, Participant, ParticipantKind,
-    ParticipantResult, ProposalId, ProposalReview, ProposalStatus, ReviewId, ReviewOutcome, TurnId,
-    TurnKind, TurnOrigin, Work, WorkArtifact, WorkAssignment, WorkConversation, WorkDecision,
-    WorkId, WorkProposal, WorkStore, WorkTurn, WorkspaceStore,
+    ConversationRef, ExecutionId, ExecutionStatus, FeltDbWorkStore, FeltDbWorkspaceStore,
+    Participant, ParticipantKind, ParticipantResult, ProposalId, ProposalReview, ProposalStatus,
+    ReviewId, ReviewOutcome, TurnId, TurnKind, TurnOrigin, Work, WorkArtifact, WorkAssignment,
+    WorkConversation, WorkDecision, WorkExecution, WorkId, WorkProposal, WorkStore, WorkTurn,
+    WorkspaceStore,
 };
 
 const USAGE: &str = "\
@@ -41,10 +42,16 @@ Usage:
   combe work proposal request-changes <proposal-id> --by <participant>
   combe work assign <id> --to <participant> [--proposal <id>] --instruction <text>
   combe work handoff <id> --to <participant> --provider <codex|claude>
+  combe work start <assignment-id> --provider <name> [--provider-id <id>]
+  combe work status <assignment-id>
+  combe work heartbeat <assignment-id>
+  combe work complete <assignment-id>
+  combe work fail <assignment-id> [--failure <text>]
+  combe work cancel <assignment-id> [--reason <text>]
   combe work turn <id> --participant <name-or-id> [--kind <kind>]
   combe work contribute <id> --participant <name-or-id> [--kind <kind>]
   combe work import <id> --participant <name-or-id> --conversation <id> [--provider <provider>] [--title <title>] [--kind <kind>]
-  combe work status <id> <active|paused|completed|archived>
+  combe work status <work-id> <active|paused|completed|archived>
   combe version             Show version information
   combe --fresh             Start without restoring previous session
   combe help                Show this help
@@ -102,9 +109,15 @@ fn work(args: &[String]) -> ExitCode {
         "proposal" => work_proposal(&store, &args[1..]),
         "assign" => work_assign(&store, &args[1..]),
         "handoff" => work_handoff(&store, &args[1..]),
+        "start" => work_start(&store, &args[1..]),
+        "heartbeat" => work_heartbeat(&store, &args[1..]),
+        "complete" => work_finish_execution(&store, &args[1..], ExecutionStatus::Completed),
+        "fail" => work_finish_execution(&store, &args[1..], ExecutionStatus::Failed),
+        "cancel" => work_finish_execution(&store, &args[1..], ExecutionStatus::Cancelled),
         "turn" => work_turn(&store, &args[1..]),
         "contribute" => work_contribute(&store, &args[1..]),
         "import" => work_import(&store, &args[1..]),
+        "status" if args.len() == 2 => work_execution_status(&store, &args[1..]),
         "status" => work_status(&store, &args[1..]),
         other => {
             eprintln!("combe: unknown work command '{other}'");
@@ -117,6 +130,19 @@ fn option(args: &[String], name: &str) -> Option<String> {
     args.windows(2)
         .find(|pair| pair[0] == name)
         .map(|pair| pair[1].clone())
+}
+
+fn bounded_execution_output(value: String) -> String {
+    let limit = combe_state::work_store::CONTEXT_TEXT_LIMIT;
+    if value.len() <= limit {
+        return value;
+    }
+    let suffix = "\n[provider output truncated]";
+    let mut end = limit.saturating_sub(suffix.len());
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &value[..end])
 }
 
 fn work_list(store: &impl WorkStore, args: &[String]) -> ExitCode {
@@ -190,6 +216,17 @@ fn work_show(store: &impl WorkStore, args: &[String]) -> ExitCode {
                 context.state.approved_proposals.len()
             );
             println!("recent results: {}", context.state.recent_results.len());
+            println!("executions: {}", context.executions.len());
+            for execution in &context.executions {
+                println!(
+                    "execution {}: {:?} · assignment {} · provider {} · result {}",
+                    execution.id,
+                    execution.status,
+                    execution.assignment_id,
+                    execution.provider,
+                    execution.result_id.as_deref().unwrap_or("none")
+                );
+            }
             ExitCode::SUCCESS
         }
         Err(error) => work_error(error),
@@ -669,6 +706,166 @@ fn work_import(store: &impl WorkStore, args: &[String]) -> ExitCode {
     }
 }
 
+fn assignment(store: &impl WorkStore, args: &[String]) -> combe_state::Result<WorkAssignment> {
+    let id = args.first().ok_or_else(|| {
+        combe_state::StateError::InvalidEntity("execution command needs an assignment id".into())
+    })?;
+    store
+        .load_assignment(&AssignmentId(id.clone()))?
+        .ok_or_else(|| combe_state::StateError::NotFound {
+            entity_type: "assignment".into(),
+            id: id.clone(),
+        })
+}
+
+fn work_start(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let result = (|| {
+        let assignment = assignment(store, args)?;
+        let provider = option(args, "--provider").ok_or_else(|| {
+            combe_state::StateError::InvalidEntity("work start needs --provider".into())
+        })?;
+        let now = Utc::now();
+        store.start_execution(WorkExecution {
+            id: ExecutionId::new(),
+            work_id: assignment.work_id,
+            assignment_id: assignment.id,
+            participant_id: assignment.to_participant_id,
+            provider,
+            provider_execution_id: option(args, "--provider-id"),
+            status: ExecutionStatus::Started,
+            started_at: now,
+            completed_at: None,
+            heartbeat_at: Some(now),
+            result_id: None,
+            failure: None,
+            created_at: now,
+            updated_at: now,
+        })
+    })();
+    match result {
+        Ok(execution) => {
+            println!("{}\t{:?}", execution.id, execution.status);
+            ExitCode::SUCCESS
+        }
+        Err(error) => work_error(error),
+    }
+}
+
+fn work_execution_status(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    match assignment(store, args).and_then(|assignment| {
+        store
+            .execution_for_assignment(&assignment.id)
+            .map(|execution| (assignment, execution))
+    }) {
+        Ok((assignment, Some(execution))) => {
+            println!("assignment: {} [{:?}]", assignment.id, assignment.status);
+            println!("execution: {} [{:?}]", execution.id, execution.status);
+            println!("provider: {}", execution.provider);
+            if let Some(id) = execution.provider_execution_id {
+                println!("provider execution: {id}");
+            }
+            if let Some(failure) = execution.failure {
+                println!("failure: {failure}");
+            }
+            ExitCode::SUCCESS
+        }
+        Ok((assignment, None)) => {
+            println!("assignment: {} [{:?}]", assignment.id, assignment.status);
+            println!("execution: not started");
+            ExitCode::SUCCESS
+        }
+        Err(error) => work_error(error),
+    }
+}
+
+fn work_heartbeat(store: &impl WorkStore, args: &[String]) -> ExitCode {
+    let result = assignment(store, args).and_then(|assignment| {
+        store
+            .execution_for_assignment(&assignment.id)?
+            .ok_or_else(|| {
+                combe_state::StateError::InvalidEntity("assignment has not started".into())
+            })
+            .and_then(|execution| store.heartbeat_execution(&execution.id, Utc::now()))
+    });
+    match result {
+        Ok(execution) => {
+            println!("{}\t{:?}", execution.id, execution.status);
+            ExitCode::SUCCESS
+        }
+        Err(error) => work_error(error),
+    }
+}
+
+fn work_finish_execution(
+    store: &impl WorkStore,
+    args: &[String],
+    status: ExecutionStatus,
+) -> ExitCode {
+    let result = (|| {
+        let assignment = assignment(store, args)?;
+        let mut execution = store
+            .execution_for_assignment(&assignment.id)?
+            .ok_or_else(|| {
+                combe_state::StateError::InvalidEntity("assignment has not started".into())
+            })?;
+        let now = Utc::now();
+        execution.status = status.clone();
+        execution.completed_at = Some(now);
+        execution.updated_at = now;
+        execution.failure = match status {
+            ExecutionStatus::Failed => {
+                option(args, "--failure").or_else(|| Some("provider reported failure".into()))
+            }
+            ExecutionStatus::Cancelled => option(args, "--reason"),
+            _ => None,
+        };
+        if status == ExecutionStatus::Cancelled {
+            return store.finish_execution(execution, None, None, Vec::new());
+        }
+        let mut output = String::new();
+        std::io::stdin()
+            .read_to_string(&mut output)
+            .map_err(|error| combe_state::StateError::InvalidEntity(error.to_string()))?;
+        if output.trim().is_empty() {
+            output = execution
+                .failure
+                .clone()
+                .unwrap_or_else(|| "Execution completed".into());
+        }
+        output = bounded_execution_output(output);
+        let result = ParticipantResult {
+            id: uuid::Uuid::new_v4().to_string(),
+            work_id: assignment.work_id.clone(),
+            participant_id: assignment.to_participant_id.clone(),
+            assignment_id: assignment.id.clone(),
+            execution_id: execution.id.0.clone(),
+            exit_status: (status == ExecutionStatus::Completed).then_some(0),
+            summary: output.lines().next().map(str::to_owned),
+            output: Some(output.clone()),
+            created_at: now,
+        };
+        let turn = WorkTurn {
+            id: TurnId::new(),
+            work_id: assignment.work_id,
+            participant_id: assignment.to_participant_id,
+            kind: TurnKind::Implementation,
+            content: output,
+            created_at: now,
+            assignment_id: Some(assignment.id),
+            execution_id: Some(execution.id.0.clone()),
+            origin: TurnOrigin::Local,
+        };
+        store.finish_execution(execution, Some(result), Some(turn), Vec::new())
+    })();
+    match result {
+        Ok(execution) => {
+            println!("{}\t{:?}", execution.id, execution.status);
+            ExitCode::SUCCESS
+        }
+        Err(error) => work_error(error),
+    }
+}
+
 fn work_handoff(store: &impl WorkStore, args: &[String]) -> ExitCode {
     let Some(id) = parse_work_id(args) else {
         eprintln!("combe: work handoff needs an id");
@@ -684,7 +881,7 @@ fn work_handoff(store: &impl WorkStore, args: &[String]) -> ExitCode {
         let provider = LocalProvider::parse(&provider_name)?;
         let adapter = LocalCliAdapter::discover(provider)?;
         let context = store.context(&id)?;
-        let mut assignment = context
+        let assignment = context
             .active_assignments
             .iter()
             .find(|assignment| {
@@ -694,34 +891,76 @@ fn work_handoff(store: &impl WorkStore, args: &[String]) -> ExitCode {
             .cloned()
             .ok_or_else(|| format!("no pending assignment for participant {target}"))?;
         let prepared = adapter.prepare(context, assignment.clone(), &participant)?;
-        assignment = store.set_assignment_status(&assignment.id, AssignmentStatus::Active)?;
-        let execution = match adapter.launch(prepared) {
-            Ok(execution) => execution,
-            Err(error) => {
-                store.set_assignment_status(&assignment.id, AssignmentStatus::Failed)?;
-                return Err(Box::new(error));
-            }
-        };
-        assignment.status = if execution.exit_status == Some(0) {
-            AssignmentStatus::Completed
-        } else {
-            AssignmentStatus::Failed
-        };
-        let mut output = execution.stdout.trim().to_string();
-        if !execution.stderr.trim().is_empty() {
-            if !output.is_empty() {
-                output.push_str("\n\nSTDERR\n");
-            }
-            output.push_str(execution.stderr.trim());
+        let started_at = Utc::now();
+        let mut canonical = store.start_execution(WorkExecution {
+            id: ExecutionId::new(),
+            work_id: id.clone(),
+            assignment_id: assignment.id.clone(),
+            participant_id: participant.id.clone(),
+            provider: provider_name.clone(),
+            provider_execution_id: None,
+            status: ExecutionStatus::Started,
+            started_at,
+            completed_at: None,
+            heartbeat_at: Some(started_at),
+            result_id: None,
+            failure: None,
+            created_at: started_at,
+            updated_at: started_at,
+        })?;
+        let provider_result = adapter.launch(prepared);
+        let (exit_status, mut output, terminal_status, failure, provider_execution_id) =
+            match provider_result {
+                Ok(result) => {
+                    let mut output = result.stdout.trim().to_string();
+                    if !result.stderr.trim().is_empty() {
+                        if !output.is_empty() {
+                            output.push_str("\n\nSTDERR\n");
+                        }
+                        output.push_str(result.stderr.trim());
+                    }
+                    let status = if result.exit_status == Some(0) {
+                        ExecutionStatus::Completed
+                    } else {
+                        ExecutionStatus::Failed
+                    };
+                    let failure = (status == ExecutionStatus::Failed)
+                        .then(|| format!("provider exited with {:?}", result.exit_status));
+                    (
+                        result.exit_status,
+                        output,
+                        status,
+                        failure,
+                        Some(result.execution_id),
+                    )
+                }
+                Err(error) => (
+                    None,
+                    error.to_string(),
+                    ExecutionStatus::Failed,
+                    Some(error.to_string()),
+                    None,
+                ),
+            };
+        if output.trim().is_empty() {
+            output = failure
+                .clone()
+                .unwrap_or_else(|| "Execution completed".into());
         }
+        output = bounded_execution_output(output);
         let now = Utc::now();
+        canonical.status = terminal_status;
+        canonical.completed_at = Some(now);
+        canonical.updated_at = now;
+        canonical.failure = failure;
+        canonical.provider_execution_id = provider_execution_id;
         let result = ParticipantResult {
             id: uuid::Uuid::new_v4().to_string(),
             work_id: id.clone(),
             participant_id: participant.id.clone(),
             assignment_id: assignment.id.clone(),
-            execution_id: execution.execution_id.clone(),
-            exit_status: execution.exit_status,
+            execution_id: canonical.id.0.clone(),
+            exit_status,
             summary: output.lines().next().map(str::to_owned),
             output: (!output.is_empty()).then(|| output.clone()),
             created_at: now,
@@ -734,11 +973,11 @@ fn work_handoff(store: &impl WorkStore, args: &[String]) -> ExitCode {
             content: output,
             created_at: now,
             assignment_id: Some(assignment.id.clone()),
-            execution_id: Some(execution.execution_id),
+            execution_id: Some(canonical.id.0.clone()),
             origin: combe_state::TurnOrigin::Local,
         };
         let artifacts = git_artifacts(&context_worktree(store, &id)?, &id, &participant.id, now);
-        store.finish_assignment(assignment, result, turn, artifacts)?;
+        store.finish_execution(canonical, Some(result), Some(turn), artifacts)?;
         Ok(())
     })();
     match result {

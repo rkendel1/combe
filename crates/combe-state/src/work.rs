@@ -39,6 +39,7 @@ id!(ArtifactId);
 id!(ConversationId);
 id!(ProposalId);
 id!(ReviewId);
+id!(ExecutionId);
 
 pub type WorkspaceId = String;
 
@@ -225,6 +226,33 @@ pub struct ParticipantResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum ExecutionStatus {
+    Started,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkExecution {
+    pub id: ExecutionId,
+    pub work_id: WorkId,
+    pub assignment_id: AssignmentId,
+    pub participant_id: ParticipantId,
+    pub provider: String,
+    pub provider_execution_id: Option<String>,
+    pub status: ExecutionStatus,
+    pub started_at: Timestamp,
+    pub completed_at: Option<Timestamp>,
+    pub heartbeat_at: Option<Timestamp>,
+    pub result_id: Option<String>,
+    pub failure: Option<String>,
+    pub created_at: Timestamp,
+    pub updated_at: Timestamp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AssignmentStatus {
     Pending,
     Active,
@@ -298,14 +326,27 @@ pub struct WorkContext {
     pub reviews: Vec<ProposalReview>,
     #[serde(default)]
     pub state: WorkState,
+    #[serde(default)]
+    pub executions: Vec<WorkExecution>,
+    #[serde(default)]
+    pub assignments: Vec<WorkAssignment>,
+    #[serde(default)]
+    pub results: Vec<ParticipantResult>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct WorkState {
     pub active_proposals: Vec<WorkProposal>,
     pub approved_proposals: Vec<WorkProposal>,
     pub active_assignments: Vec<WorkAssignment>,
     pub recent_results: Vec<WorkTurn>,
+    pub assigned: Vec<WorkAssignment>,
+    pub active_executions: Vec<WorkExecution>,
+    pub stale_executions: Vec<WorkExecution>,
+    pub completed_executions: Vec<WorkExecution>,
+    pub failed_executions: Vec<WorkExecution>,
+    pub cancelled_executions: Vec<WorkExecution>,
 }
 
 #[cfg(test)]
