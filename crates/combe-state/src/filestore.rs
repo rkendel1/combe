@@ -183,15 +183,14 @@ impl WorkspaceStore for FileWorkspaceStore {
 
     fn delete_workspace(&self, workspace_id: &str) -> Result<()> {
         let mut file_state = self.load_file()?;
-        file_state.workspaces.retain(|w| w.id != workspace_id);
-        file_state.tabs.retain(|t| t.workspace_id != workspace_id);
-
         let affected_tab_ids: Vec<_> = file_state
             .tabs
             .iter()
             .filter(|t| t.workspace_id == workspace_id)
             .map(|t| t.id.clone())
             .collect();
+        file_state.workspaces.retain(|w| w.id != workspace_id);
+        file_state.tabs.retain(|t| t.workspace_id != workspace_id);
         file_state
             .panes
             .retain(|p| !affected_tab_ids.contains(&p.tab_id));

@@ -185,6 +185,7 @@ name = "combe"
 version = "0.1.0"
 dependencies = [
  "block2",
+ "chrono",
  "combe-catalog",
  "combe-state",
  "ghostty-sys",

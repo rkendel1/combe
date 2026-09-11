@@ -23,5 +23,11 @@ Use these words in code, commits, and docs. If a new domain word sticks, add it 
 | Habits | Compiled-in preferences in `crates/combe/src/habits.rs`. There is no config file. |
 | Occlusion | A hidden tab's surfaces are told to stop drawing via `ghostty_surface_set_occlusion`. |
 | State file | `~/Library/Application Support/combe/state.json` |
+| Work | A durable unit of human and external-agent collaboration belonging to a workspace. Execution is not part of its identity. |
+| Participant | A provider-neutral human, agent, or system contributing to a Work. |
+| Turn | One durable contribution to a Work, independent of a terminal invocation or provider transcript. |
+| Assignment | A durable handoff from one Work participant to another. It records intent and state but does not dispatch execution. |
+| Decision | An independently queryable statement and optional rationale recorded for a Work. |
+| Artifact | A durable reference from a Work to a repository-owned file, patch, commit, report, review, or note. |
 
 Out of vocabulary: agent session, workbench, desk, execution host, orcad, theme, setting, preference pane.

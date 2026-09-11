@@ -38,9 +38,17 @@ The catalog always includes a Home workspace at `$HOME` unless a row already own
 
 Repos are never discovered by walking the disk.
 
+### Work coordination
+
+A workspace may own multiple Works over time. A Work is durable context for a bounded objective; it is not a terminal session, process, provider conversation, task hierarchy, or agent runtime. Combe owns the context and external humans and agents contribute to it. FeltDB is the sole durable authority for Works, participants, turns, assignments, decisions, and artifact references. Repository files remain authoritative for artifact contents.
+
+The sidebar appends a WORK section for the selected workspace. Selecting a Work keeps its workspace terminal available and shows a native read-only overview beside it with title, objective, status, participants, recent turns, active assignments, and decisions. The overview is not a chat surface and does not dispatch or supervise agents.
+
+`WorkStore` is the application boundary. `FeltDbWorkStore` alone owns the `combe/work`, `combe/participant`, `combe/turn`, `combe/assignment`, `combe/decision`, and `combe/artifact` key representations and uses FeltDB atomic transactions for multi-record consistency. Context projection is deterministic and bounded to 50 recent turns, 100 decisions, and 100 artifact references. Combe is the single-process owner of this database; FeltDB provides thread-safe access within that process but no multi-process file-locking contract.
+
 ## Non-goals
 
-- Agents, chat overlays, command palettes
+- Proprietary agents, provider chat overlays, automatic agent dispatch, provider authentication, or process supervision
 - In-app editor, browser, diffs, PR/issue chrome
 - SSH, WSL, remote hosts, a PTY daemon that survives app updates
 - A settings GUI, a theme market, cloud sync, user configuration files
@@ -55,7 +63,8 @@ Repos are never discovered by walking the disk.
 | Terminal leaf | Full `libghostty` surface | Metal renderer, PTY, VT, and CoreText in one embedded surface. Ghostty owns its `IOSurfaceLayer` and drives its own frames. |
 | Ghostty build | `vendor/ghostty` submodule, built by `zig`, linked statically | `crates/ghostty-sys` runs `zig build -Dapp-runtime=none` and bindgen over `include/ghostty.h`. Nothing is invented beyond that header. |
 | Git | User's `git` binary | `worktree list --porcelain` is the catalog. Git 2.25 is the floor. |
-| State | `~/Library/Application Support/combe/state.json` | Registered repo paths. Nothing else persists. |
+| Catalog state | `~/Library/Application Support/combe/state.json` | Registered repo paths only. |
+| Workspace and Work state | FeltDB at `~/Library/Application Support/combe/workspace-data` | Direct Rust API; sole durable authority for restored workspace records and Work context. |
 | Preferences | `crates/combe/src/habits.rs` | Font, colors, padding, shell, window size. Compiled in, not read from disk. |
 
 Rejected:

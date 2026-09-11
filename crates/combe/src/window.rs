@@ -34,6 +34,8 @@ use crate::sidebar;
 use crate::split;
 use crate::surface::SurfaceView;
 use crate::tabs::Tabs;
+use crate::work_overview;
+use combe_state::{FeltDbWorkStore, WorkId, WorkStore};
 
 const ROW_HEIGHT: f64 = 36.0;
 const HEADER_HEIGHT: f64 = 30.0;
@@ -89,6 +91,7 @@ struct State {
     tab_bar: Retained<NSView>,
     tab_scroller: Retained<NSScrollView>,
     content: Retained<NSView>,
+    work_overview: Option<Retained<NSScrollView>>,
     tabs: Tabs,
     repos: Vec<sidebar::Repo>,
     collapsed_repos: HashSet<PathBuf>,
@@ -110,6 +113,7 @@ enum Click {
     NewTab,
     AddRepo,
     ToggleRepo(PathBuf),
+    OpenWork(WorkId),
 }
 
 pub enum TabTarget {
@@ -837,6 +841,7 @@ pub fn open(mtm: MainThreadMarker) {
             tab_bar: tab_bar.clone(),
             tab_scroller,
             content: content.clone(),
+            work_overview: None,
             tabs: Tabs::default(),
             repos: Vec::new(),
             collapsed_repos: HashSet::new(),
@@ -908,6 +913,7 @@ fn first_row() -> Option<(String, String)> {
 
 fn dispatch(click: Click) {
     dismiss_overview(false);
+    dismiss_work_overview();
     match click {
         Click::Open(path, label) => {
             open_worktree(&path, &label);
@@ -958,6 +964,56 @@ fn dispatch(click: Click) {
             });
             rebuild_sidebar();
         }
+        Click::OpenWork(id) => open_work_overview(&id),
+    }
+}
+
+fn dismiss_work_overview() {
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(state) = state.as_mut() else { return };
+        if let Some(view) = state.work_overview.take() {
+            view.removeFromSuperview();
+        }
+        if let Some(tab) = state.tabs.active() {
+            tab.root.setFrame(state.content.bounds());
+        }
+    });
+}
+
+fn open_work_overview(id: &WorkId) {
+    let Ok(store) = FeltDbWorkStore::for_combe() else {
+        return;
+    };
+    let Ok(context) = store.context(id) else {
+        return;
+    };
+    let mtm = MainThreadMarker::new().expect("main thread");
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        let Some(state) = state.as_mut() else { return };
+        let view = work_overview::new(mtm, state.content.bounds(), &context);
+        state.content.addSubview(&view);
+        state.work_overview = Some(view);
+        layout_work_overview(state);
+    });
+}
+
+fn layout_work_overview(state: &State) {
+    let Some(view) = state.work_overview.as_ref() else {
+        return;
+    };
+    let bounds = state.content.bounds();
+    let width = bounds.size.width.min(380.0).max(280.0);
+    view.setFrame(NSRect::new(
+        NSPoint::new(bounds.size.width - width, 0.0),
+        NSSize::new(width, bounds.size.height),
+    ));
+    if let Some(tab) = state.tabs.active() {
+        tab.root.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new((bounds.size.width - width).max(0.0), bounds.size.height),
+        ));
     }
 }
 
@@ -2040,12 +2096,25 @@ fn rebuild_sidebar() {
             .and_then(|view| view.identifier());
         let clip = state.sidebar.contentView().frame().size;
         let width = state.sidebar_width.get();
+        let works = state
+            .tabs
+            .current()
+            .and_then(|workspace| {
+                FeltDbWorkStore::for_combe()
+                    .ok()?
+                    .list_works(Some(workspace))
+                    .ok()
+            })
+            .unwrap_or_default();
         let mut height = 20.0 + state.repos.len().saturating_sub(1) as f64 * 16.5;
         for repo in &state.repos {
             height += HEADER_HEIGHT;
             if !state.collapsed_repos.contains(&repo.path) {
                 height += repo.rows.len() as f64 * ROW_HEIGHT;
             }
+        }
+        if !works.is_empty() {
+            height += 16.5 + HEADER_HEIGHT + works.len() as f64 * ROW_HEIGHT;
         }
         state.sidebar_height.set(height);
 
@@ -2142,6 +2211,44 @@ fn rebuild_sidebar() {
                 };
                 view.setAccessibilityLabel(Some(&NSString::from_str(&access)));
                 document.addSubview(&view);
+                y += ROW_HEIGHT;
+            }
+        }
+
+        if !works.is_empty() {
+            y += 16.5;
+            let heading = ClickView::new(
+                mtm,
+                NSRect::new(
+                    NSPoint::new(6.0, y),
+                    NSSize::new(width - 12.0, HEADER_HEIGHT),
+                ),
+                "WORK",
+                12.0,
+                12.0,
+                || {},
+            );
+            heading.dim_when_idle();
+            heading.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+            document.addSubview(&heading);
+            y += HEADER_HEIGHT;
+            for work in works {
+                let id = work.id.clone();
+                let label = format!("{} — {:?}", work.title, work.status);
+                let row = ClickView::new(
+                    mtm,
+                    NSRect::new(
+                        NSPoint::new(6.0, y + 2.0),
+                        NSSize::new(width - 12.0, ROW_HEIGHT - 2.0),
+                    ),
+                    &label,
+                    32.0,
+                    12.0,
+                    move || dispatch(Click::OpenWork(id.clone())),
+                );
+                row.setAutoresizingMask(NSAutoresizingMaskOptions::ViewWidthSizable);
+                row.setAccessibilityLabel(Some(&NSString::from_str(&label)));
+                document.addSubview(&row);
                 y += ROW_HEIGHT;
             }
         }
@@ -2556,6 +2663,7 @@ fn layout_chrome() {
                     (right_size.height - TOP_BAR_HEIGHT - status_h.max(INSET)).max(0.0),
                 ),
             ));
+            layout_work_overview(state);
         }
         if !state
             .window

@@ -95,12 +95,13 @@ mod tests {
             repos: vec![Repo {
                 path: PathBuf::from("/tmp/repo"),
             }],
+            ..State::default()
         };
         save_state(&path, &state).unwrap();
         assert_eq!(load_state(&path).unwrap(), state);
 
         let mut previous = std::fs::File::open(&path).unwrap();
-        let updated = State { repos: Vec::new() };
+        let updated = State::default();
         save_state(&path, &updated).unwrap();
         assert_eq!(load_state(&path).unwrap(), updated);
 

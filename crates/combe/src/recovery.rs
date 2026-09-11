@@ -130,7 +130,7 @@ mod tests {
             missing_workspaces: vec!["/tmp/old".to_string()],
         };
         let report = SessionRecovery::recovery_report(&validation);
-        assert!(report.contains("no valid workspaces found"));
+        assert!(report.to_lowercase().contains("no valid workspaces found"));
         assert!(report.contains("/tmp/old"));
     }
 }

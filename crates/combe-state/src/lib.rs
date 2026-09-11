@@ -1,19 +1,25 @@
 pub mod error;
-pub mod store;
 pub mod feltdb;
-pub mod migration;
-pub mod memory;
 pub mod filestore;
+pub mod memory;
+pub mod migration;
+pub mod store;
+pub mod work;
+pub mod work_feltdb;
+pub mod work_store;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub use error::{StateError, Result};
-pub use store::WorkspaceStore;
+pub use error::{Result, StateError};
 pub use feltdb::FeltDbWorkspaceStore;
-pub use migration::migrate_from_json;
-pub use memory::InMemoryWorkspaceStore;
 pub use filestore::FileWorkspaceStore;
+pub use memory::InMemoryWorkspaceStore;
+pub use migration::migrate_from_json;
+pub use store::WorkspaceStore;
+pub use work::*;
+pub use work_feltdb::FeltDbWorkStore;
+pub use work_store::WorkStore;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Hash)]
 pub enum WorkspaceKind {

@@ -228,6 +228,17 @@
     .tabs { overflow-x: auto; scrollbar-width: none; }
     .term.down { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
     .term.down .pane + .pane { border-left: 0; border-top: .5px solid var(--line); }
+    .term.work-active { grid-template-columns: minmax(0, 1fr) 360px; }
+    .work-overview { padding: 28px 24px; border-left: .5px solid var(--line); overflow: auto; font: var(--font); white-space: normal; }
+    .work-overview[hidden] { display: none; }
+    .work-overview h1 { margin: 0 0 6px; font-size: 20px; font-weight: 600; }
+    .work-status { color: var(--green); font-size: 12px; }
+    .work-objective { margin: 18px 0 24px; color: var(--text-soft); line-height: 1.55; }
+    .work-overview h2 { margin: 20px 0 8px; color: var(--muted); font-size: 11px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; }
+    .work-overview ul { margin: 0; padding-left: 18px; color: var(--text-soft); line-height: 1.55; }
+    .work-group { margin-top: 16px; padding-top: 8px; border-top: .5px solid var(--line); }
+    .work-row { padding-left: 32px; }
+    .work-row .work-state { margin-left: auto; color: var(--green); font-size: 11px; }
     .pane { position: relative; }
     .find-bar { position: absolute; right: 12px; top: 8px; z-index: 2; display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: var(--glass-panel); box-shadow: var(--glass-edge), 0 6px 20px #0002; border-radius: 12px; font: var(--font); }
     .find-bar input { width: 120px; }
@@ -284,7 +295,7 @@
 </head>
 <body>
   <main class="page">
-    <div class="note"><span><strong>Combe</strong>Interface design</span><div class="preview-tools"><label>Appearance <select id="appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label><label>Component <select id="component"><option value="workspace">Workspace</option><option value="typography">Typography</option><option value="find">Find bar</option><option value="down">Split down</option><option value="zoom">Zoomed pane</option><option value="confirm">Close confirmation</option><option value="claude">One provider</option><option value="none">No quota snapshot</option></select></label><label class="spacing-toggle"><input id="spacing-toggle" type="checkbox" aria-controls="spacing-inspector">Show spacing</label></div></div>
+    <div class="note"><span><strong>Combe</strong>Interface design</span><div class="preview-tools"><label>Appearance <select id="appearance"><option value="system">System</option><option value="light">Light</option><option value="dark">Dark</option></select></label><label>Component <select id="component"><option value="workspace">Workspace</option><option value="work">Work overview</option><option value="typography">Typography</option><option value="find">Find bar</option><option value="down">Split down</option><option value="zoom">Zoomed pane</option><option value="confirm">Close confirmation</option><option value="claude">One provider</option><option value="none">No quota snapshot</option></select></label><label class="spacing-toggle"><input id="spacing-toggle" type="checkbox" aria-controls="spacing-inspector">Show spacing</label></div></div>
     <div id="spacing-toolbar" class="spacing-controls spacing-toolbar" hidden><label>Area <select id="spacing-area"><option value="window">Window</option><option value="header">Workspace header</option><option value="tabs">Tabs</option><option value="sidebar">Sidebar catalog</option><option value="terminal" selected>Terminal and splits</option><option value="quota">Quota</option><option value="find">Find bar</option><option value="system">System controls</option><option value="radii">Corner radii</option><option value="all">All areas</option></select></label><label>Measure <select id="spacing-metric"></select></label><label>Sidebar <select id="spacing-sidebar"><option value="closed">Closed</option><option value="open">Transient</option><option value="pinned">Pinned</option></select></label><button type="button" id="spacing-all">Area overview</button><output id="spacing-active" class="spacing-readout"></output></div>
     <div class="stage">
       <div class="window" id="win">
@@ -307,7 +318,7 @@
         </aside>
         <section class="right" aria-label="Terminal preview">
           <div class="tabs" id="tabs"></div>
-          <div class="term"><div class="pane" id="left"></div><div class="pane" id="right"></div></div>
+          <div class="term"><div class="pane" id="left"></div><div class="pane" id="right"></div><article class="work-overview" id="work-overview" aria-label="Work overview" hidden><h1>FeltDB integration</h1><span class="work-status">Active</span><p class="work-objective">Establish durable, provider-neutral context that humans and external agents can continue.</p><h2>Participants</h2><ul><li>Randy · Human</li><li>Implementation agent · Agent</li><li>Security reviewer · Agent</li></ul><h2>Active assignments</h2><ul><li>Implement the WorkStore adapter</li></ul><h2>Decisions</h2><ul><li>Use FeltDB directly from Combe</li></ul><h2>Recent turns</h2><ul><li>Architecture accepted</li><li>Implementation in progress</li></ul></article></div>
           <footer class="status-line" aria-label="Usage status">
             <div class="quota" id="quota">
               <div class="quota-details" id="quota-details" role="region" aria-label="Quota details" tabindex="-1" inert>
@@ -421,12 +432,20 @@
         group.append(head, rows);
         list.append(group);
       }
+      const workGroup = document.createElement("div");
+      workGroup.className = "group work-group";
+      workGroup.innerHTML = '<div class="group-head"><span>WORK</span></div><div class="rows"><button class="row work-row" type="button"><span class="label">FeltDB integration</span><span class="work-state">Active</span></button></div>';
+      workGroup.querySelector("button").addEventListener("click", () => {
+        document.getElementById("component").value = "work";
+        renderTabs();
+      });
+      list.append(workGroup);
       updateShortcuts();
     }
 
     function updateShortcuts() {
       let index = 0;
-      for (const button of list.querySelectorAll(".row")) {
+      for (const button of list.querySelectorAll(".group:not(.work-group) .row")) {
         const number = !button.closest(".group").classList.contains("shut") && index < 9 ? String(++index) : "";
         button.querySelector(".shortcut").textContent = number;
         if (number) {
@@ -524,8 +543,12 @@
     function applyComponent() {
       const value = document.getElementById("component").value;
       const term = document.querySelector(".term");
+      const workOverview = document.getElementById("work-overview");
       left.querySelector(".find-bar")?.remove();
       term.classList.toggle("down", value === "down");
+      term.classList.toggle("work-active", value === "work");
+      workOverview.hidden = value !== "work";
+      if (value === "work") { right.hidden = true; term.classList.remove("single"); }
       if (value === "down") { right.hidden = false; term.classList.remove("single"); }
       if (value === "zoom") { right.hidden = true; term.classList.add("single"); }
       if (value === "typography") left.innerHTML += '\n\nLatin ABC — 0123456789\n中文排版 — 日本語 — 한국어\n<strong>Bold text</strong>  <span data-prompt>ANSI color</span>';
