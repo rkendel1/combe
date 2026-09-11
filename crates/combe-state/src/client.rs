@@ -1,33 +1,28 @@
 use crate::protocol::{Request, Response, RuntimeConfig, TransactOperation};
+use crate::transport::SocketTransport;
 use crate::{Result, StateError};
 use serde_json::json;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 pub struct FeltDbLocalClient {
     config: RuntimeConfig,
-    _connection: Arc<Mutex<ClientConnection>>,
-}
-
-struct ClientConnection {
-    socket_path: PathBuf,
-    _connected: bool,
+    transport: Arc<Mutex<SocketTransport>>,
 }
 
 impl FeltDbLocalClient {
     pub fn connect(config: RuntimeConfig) -> Result<Self> {
         Self::ensure_runtime(&config)?;
-        Self::perform_handshake(&config)?;
 
-        let connection = ClientConnection {
-            socket_path: config.socket_path.clone(),
-            _connected: true,
+        let transport = SocketTransport::connect(&config.socket_path)?;
+        let transport = Arc::new(Mutex::new(transport));
+
+        let client = Self {
+            config: config.clone(),
+            transport,
         };
 
-        Ok(Self {
-            config,
-            _connection: Arc::new(Mutex::new(connection)),
-        })
+        client.perform_handshake()?;
+        Ok(client)
     }
 
     pub fn for_combe() -> Result<Self> {
@@ -60,12 +55,40 @@ impl FeltDbLocalClient {
         todo!("Wait for FeltDB runtime to be ready at socket: {}", config.socket_path.display())
     }
 
-    fn perform_handshake(config: &RuntimeConfig) -> Result<()> {
-        todo!("Perform HELLO/READY handshake with runtime")
+    fn perform_handshake(&self) -> Result<()> {
+        let hello = Request::hello(&self.config.client_id, &self.config.database_id);
+        let response = self.send_request(hello)?;
+
+        if !response.is_success() {
+            return Err(StateError::FeltDbError(
+                response.get_error_message().unwrap_or_else(|| "Handshake failed".to_string()),
+            ));
+        }
+
+        let payload = response.payload.as_ref().ok_or_else(|| {
+            StateError::FeltDbError("READY response missing payload".to_string())
+        })?;
+
+        let version = payload.get("version").and_then(|v| v.as_u64());
+        if version != Some(1) {
+            return Err(StateError::FeltDbError(format!(
+                "Incompatible protocol version: {}",
+                version.unwrap_or(0)
+            )));
+        }
+
+        Ok(())
     }
 
     fn send_request(&self, request: Request) -> Result<Response> {
-        todo!("Send request over Unix domain socket and receive response")
+        let request_json = serde_json::to_value(&request)?;
+        let mut transport = self.transport.lock().unwrap();
+
+        transport.send_message(&request_json)?;
+        let response_json = transport.receive_message()?;
+
+        serde_json::from_value(response_json)
+            .map_err(|e| StateError::FeltDbError(format!("Invalid response: {}", e)))
     }
 
     pub fn query(

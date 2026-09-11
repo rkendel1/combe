@@ -1,6 +1,7 @@
 pub mod error;
 pub mod store;
 pub mod protocol;
+pub mod transport;
 pub mod client;
 pub mod feltdb;
 pub mod migration;

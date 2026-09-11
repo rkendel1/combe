@@ -1,4 +1,3 @@
-use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -126,7 +125,7 @@ pub enum TransactOperation {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub client_id: String,
     pub database_id: String,
